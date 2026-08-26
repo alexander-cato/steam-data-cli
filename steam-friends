@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""
+steam-friends: list a Steam account's friends sorted by when they were added.
+
+Stdlib only; no third-party packages required. Python 3.7+.
+
+Quick start:
+    ./steam-friends                      # interactive: prompts for what it needs
+    ./steam-friends --id yourvanityname       # vanity name, SteamID64, or profile URL
+    ./steam-friends --format csv -o friends.csv
+
+Credentials are read from, in order of precedence:
+    1. --key / --id command-line flags
+    2. STEAM_API_KEY / STEAM_ID env vars
+    3. the config file (~/.config/steam-friends/config.json, mode 0600)
+    4. an interactive prompt (key input is hidden)
+
+Get an API key at https://steamcommunity.com/dev/apikey
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import stat
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from getpass import getpass
+
+API = "https://api.steampowered.com"
+UA = "steam-friends/1.0 (+stdlib urllib)"
+SUMMARY_BATCH = 100          # Steam's documented max ids per GetPlayerSummaries call
+TIMEOUT = 20                 # seconds per HTTP request
+RETRIES = 4                  # attempts for transient failures
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "steam-friends",
+)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+KEY_RE = re.compile(r"^[0-9A-Fa-f]{32}$")
+ID64_RE = re.compile(r"^7656119[0-9]{10}$")
+VANITY_RE = re.compile(r"^[A-Za-z0-9_.\-]{2,64}$")
+
+
+# ── terminal helpers ────────────────────────────────────────────────────────
+
+def _use_color(stream) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+COLOR = _use_color(sys.stderr)
+
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if COLOR else text
+
+
+def info(msg: str) -> None:
+    print(_c("2", f"  {msg}"), file=sys.stderr)
+
+
+def warn(msg: str) -> None:
+    print(_c("33", f"  warning: {msg}"), file=sys.stderr)
+
+
+def die(msg: str, hint: str = "", code: int = 1):
+    print(_c("31;1", "error: ") + msg, file=sys.stderr)
+    if hint:
+        print("\n" + hint, file=sys.stderr)
+    sys.exit(code)
+
+
+def display_width(s: str) -> int:
+    """Terminal cell width of a string, accounting for wide and combining chars."""
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - display_width(s))
+
+
+# ── HTTP ────────────────────────────────────────────────────────────────────
+
+class SteamError(Exception):
+    def __init__(self, message: str, status: int = 0, hint: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.hint = hint
+
+
+def _redact(text: str, secret: str) -> str:
+    """Never let a key reach a log line, traceback, or terminal."""
+    return text.replace(secret, "<redacted>") if secret else text
+
+
+def call(endpoint: str, key: str, params: dict) -> dict:
+    """GET a Steam Web API endpoint with retries; return the parsed JSON body.
+
+    The key travels in the query string (Steam offers no header auth), but it is
+    never placed in argv and is scrubbed from every error path.
+    """
+    query = dict(params)
+    query["key"] = key
+    url = f"{API}/{endpoint}?" + urllib.parse.urlencode(query)
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+
+    last = ""
+    for attempt in range(1, RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                raw = r.read().decode("utf-8", "replace")
+            if not raw.strip():
+                raise SteamError(f"{endpoint} returned an empty body")
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise SteamError(f"{endpoint} returned malformed JSON ({e})")
+
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                raw_body = e.read().decode("utf-8", "replace")
+                body = re.sub(r"<[^>]+>", " ", raw_body)
+                body = re.sub(r"\s+", " ", body).strip()[:160]
+            except Exception:
+                pass
+
+            if e.code in (401, 403):
+                hint = ""
+                if "GetFriendList" not in endpoint:
+                    hint = (
+                        "Steam rejected the API key itself. Check that it was copied\n"
+                        "whole from https://steamcommunity.com/dev/apikey, and that it\n"
+                        "has not been revoked or regenerated since."
+                    )
+                raise SteamError(
+                    f"Steam returned HTTP {e.code} for {endpoint.split('/')[1]}"
+                    + (f": {body}" if body and body not in ("{}", "") else ""),
+                    status=e.code, hint=hint,
+                )
+            if e.code == 429:
+                last = "HTTP 429 rate limited"
+            elif 500 <= e.code < 600:
+                last = f"HTTP {e.code} server error"
+            else:
+                raise SteamError(
+                    f"HTTP {e.code} from {endpoint}"
+                    + (f": {body}" if body else ""),
+                    status=e.code,
+                )
+
+        except urllib.error.URLError as e:
+            last = f"network error: {_redact(str(e.reason), key)}"
+        except TimeoutError:
+            last = f"timed out after {TIMEOUT}s"
+        except SteamError as e:
+            last = str(e)
+
+        if attempt < RETRIES:
+            backoff = min(2 ** attempt, 8)
+            info(f"{last}; retrying in {backoff}s ({attempt}/{RETRIES - 1})")
+            time.sleep(backoff)
+
+    raise SteamError(f"{endpoint} failed after {RETRIES} attempts. {last}")
+
+
+# ── config ──────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            warn(f"{CONFIG_PATH} is not a JSON object; ignoring it")
+            return {}
+        mode = stat.S_IMODE(os.stat(CONFIG_PATH).st_mode)
+        if mode & 0o077:
+            warn(f"{CONFIG_PATH} is readable by others (mode {mode:04o}); "
+                 f"run: chmod 600 {CONFIG_PATH}")
+        return data
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        warn(f"could not read {CONFIG_PATH}: {e}")
+        return {}
+
+
+def save_config(key: str, steam_id: str) -> None:
+    try:
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+        fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"api_key": key, "steam_id": steam_id}, f, indent=2)
+            f.write("\n")
+        os.chmod(CONFIG_PATH, 0o600)
+        info(f"saved to {CONFIG_PATH} (mode 0600)")
+    except OSError as e:
+        warn(f"could not save config: {e}")
+
+
+# ── identity resolution ─────────────────────────────────────────────────────
+
+def parse_identity(raw: str):
+    """Return ('id64'|'vanity', value) from an id, vanity name, or profile URL."""
+    s = raw.strip()
+    if not s:
+        raise ValueError("empty identifier")
+
+    if "steamcommunity.com" in s:
+        path = urllib.parse.urlparse(s if "//" in s else "https://" + s).path
+        parts = [p for p in path.split("/") if p]
+        for i, part in enumerate(parts):
+            if part in ("profiles", "id") and i + 1 < len(parts):
+                nxt = parts[i + 1]
+                if part == "profiles":
+                    if not ID64_RE.match(nxt):
+                        raise ValueError(f"{nxt!r} in /profiles/ is not a SteamID64")
+                    return "id64", nxt
+                return "vanity", nxt
+        raise ValueError(f"could not find a profile in URL {s!r}")
+
+    if s.isdigit():
+        if not ID64_RE.match(s):
+            raise ValueError(
+                f"{s!r} is numeric but not a SteamID64 "
+                "(expected 17 digits beginning 7656119)"
+            )
+        return "id64", s
+
+    if VANITY_RE.match(s):
+        return "vanity", s
+
+    raise ValueError(f"{s!r} is not a recognisable SteamID64, vanity name, or profile URL")
+
+
+def resolve(raw: str, key: str) -> str:
+    kind, value = parse_identity(raw)
+    if kind == "id64":
+        return value
+
+    info(f"resolving vanity name {value!r}…")
+    resp = call("ISteamUser/ResolveVanityURL/v1/", key, {"vanityurl": value}).get("response", {})
+    if resp.get("success") != 1 or not resp.get("steamid"):
+        raise SteamError(
+            f"no Steam account has the vanity name {value!r} "
+            f"({resp.get('message') or 'not found'})",
+            hint="Check the spelling, or pass the 17-digit SteamID64 directly.",
+        )
+    return resp["steamid"]
+
+
+# ── data fetching ───────────────────────────────────────────────────────────
+
+def fetch_friends(steam_id: str, key: str, relationship: str) -> list:
+    try:
+        resp = call(
+            "ISteamUser/GetFriendList/v1/", key,
+            {"steamid": steam_id, "relationship": relationship},
+        )
+    except SteamError as e:
+        if e.status in (401, 403):
+            raise SteamError(
+                f"Steam refused the friends list for {steam_id} (HTTP {e.status}).",
+                status=e.status,
+                hint=(
+                    "The API key is fine. This is a privacy setting.\n\n"
+                    "Steam treats the friends list as SEPARATE from overall profile\n"
+                    "privacy, and GetFriendList enforces it. Owning the API key does\n"
+                    "not grant privileged access to your own list.\n\n"
+                    "Fix: Steam → Profile → Edit Profile → Privacy Settings, set\n"
+                    '  "My friends list"  →  Public\n'
+                    "then re-run. You can set it back afterwards; it only needs to be\n"
+                    "public for the moment of the call."
+                ),
+            )
+        raise
+
+    friends = (resp.get("friendslist") or {}).get("friends")
+    if friends is None:
+        raise SteamError("unexpected response shape: no friendslist.friends key")
+    return friends
+
+
+def fetch_names(ids: list, key: str) -> dict:
+    """Map SteamID64 → persona name, batching at Steam's 100-id limit."""
+    names = {}
+    batches = [ids[i:i + SUMMARY_BATCH] for i in range(0, len(ids), SUMMARY_BATCH)]
+    for n, batch in enumerate(batches, 1):
+        if len(batches) > 1:
+            info(f"fetching names, batch {n}/{len(batches)}…")
+        try:
+            resp = call("ISteamUser/GetPlayerSummaries/v2/", key,
+                        {"steamids": ",".join(batch)})
+        except SteamError as e:
+            warn(f"name lookup batch {n} failed ({e}); those rows show the raw id")
+            continue
+        for p in (resp.get("response") or {}).get("players", []):
+            if p.get("steamid"):
+                names[p["steamid"]] = p.get("personaname") or ""
+    return names
+
+
+# ── output ──────────────────────────────────────────────────────────────────
+
+def fmt_time(ts: int, utc: bool) -> str:
+    if not ts:
+        return ""
+    fn = time.gmtime if utc else time.localtime
+    return time.strftime("%Y-%m-%d %H:%M", fn(ts))
+
+
+def build_rows(friends: list, names: dict, utc: bool, oldest_first: bool) -> list:
+    rows = []
+    for f in friends:
+        sid = str(f.get("steamid", ""))
+        ts = int(f.get("friend_since") or 0)
+        rows.append({
+            "added": fmt_time(ts, utc),
+            "friend_since": ts,
+            "steamid": sid,
+            "name": names.get(sid) or "",
+            "relationship": f.get("relationship") or "",
+        })
+    # Entries with friend_since == 0 carry no date; park them at the end in both
+    # directions rather than letting them masquerade as 1970.
+    dated = [r for r in rows if r["friend_since"]]
+    undated = [r for r in rows if not r["friend_since"]]
+    dated.sort(key=lambda r: r["friend_since"], reverse=not oldest_first)
+    undated.sort(key=lambda r: r["steamid"])
+    return dated + undated
+
+
+def render_table(rows: list, show_rel: bool) -> str:
+    if not rows:
+        return ""
+    headers = ["#", "ADDED", "STEAMID64", "NAME"] + (["REL"] if show_rel else [])
+    body = []
+    for i, r in enumerate(rows, 1):
+        cells = [str(i), r["added"] or "unknown", r["steamid"], r["name"] or "?"]
+        if show_rel:
+            cells.append(r["relationship"])
+        body.append(cells)
+    widths = [
+        max(display_width(h), max(display_width(c[i]) for c in body))
+        for i, h in enumerate(headers)
+    ]
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("─" * w for w in widths)]
+    out += ["  ".join(pad(c, w) for c, w in zip(cells, widths)).rstrip() for cells in body]
+    return "\n".join(out)
+
+
+def render_summary(rows: list, shown: int = 0) -> str:
+    """Per-year breakdown. `rows` is always the FULL list so the counts stay
+    honest under --limit; `shown` only annotates how much was displayed."""
+    dated = [r for r in rows if r["friend_since"]]
+    if not dated:
+        return ""
+    years = {}
+    for r in dated:
+        years[r["added"][:4]] = years.get(r["added"][:4], 0) + 1
+    peak = max(years.values())
+    head = f"{len(rows)} friends"
+    if len(dated) != len(rows):
+        head += f" ({len(rows) - len(dated)} without a recorded date)"
+    if shown and shown < len(rows):
+        head += f", {shown} shown"
+    lines = ["", head]
+    for y in sorted(years):
+        bar = "█" * max(1, round(years[y] / peak * 28))
+        lines.append(f"  {y}  {bar} {years[y]}")
+    return "\n".join(lines)
+
+
+def write_output(rows: list, fmt: str, dest, show_rel: bool) -> None:
+    if fmt == "table":
+        dest.write(render_table(rows, show_rel) + "\n")
+    elif fmt == "json":
+        json.dump([{k: v for k, v in r.items() if k != "relationship" or show_rel}
+                   for r in rows], dest, indent=2, ensure_ascii=False)
+        dest.write("\n")
+    elif fmt in ("csv", "tsv"):
+        cols = ["added", "friend_since", "steamid", "name"] + (["relationship"] if show_rel else [])
+        w = csv.DictWriter(dest, fieldnames=cols, delimiter="\t" if fmt == "tsv" else ",",
+                           extrasaction="ignore", lineterminator="\n")
+        w.writeheader()
+        w.writerows(rows)
+
+
+# ── credential gathering ────────────────────────────────────────────────────
+
+def _ask(prompt: str, hidden: bool = False) -> str:
+    """Read one line, treating EOF/Ctrl-C as a clean abort."""
+    try:
+        return (getpass(prompt) if hidden else input(prompt)).strip()
+    except EOFError:
+        print(file=sys.stderr)
+        die("input ended before a value was given")
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+    return ""
+
+
+def prompt_key() -> str:
+    print("A Steam Web API key is needed. Get one at:\n"
+          "  https://steamcommunity.com/dev/apikey\n"
+          "(needs an account that has spent at least $5; 'limited' accounts "
+          "cannot create keys)\n", file=sys.stderr)
+    for _ in range(3):
+        key = _ask("Steam API key (hidden): ", hidden=True)
+        if KEY_RE.match(key):
+            return key
+        print("  that does not look like a key, expected 32 hex characters\n",
+              file=sys.stderr)
+    die("no valid API key given")
+
+
+def prompt_identity() -> str:
+    print("\nWhose friends list? Accepts a SteamID64, a vanity name, or a profile URL.\n"
+          "  e.g. 76561198000000000 | yourvanityname | "
+          "https://steamcommunity.com/id/yourvanityname/\n", file=sys.stderr)
+    for _ in range(3):
+        raw = _ask("Steam ID / vanity / URL: ")
+        try:
+            parse_identity(raw)
+            return raw
+        except ValueError as e:
+            print(f"  {e}\n", file=sys.stderr)
+    die("no valid Steam identity given")
+
+
+def gather_credentials(args, interactive: bool):
+    cfg = load_config()
+    key = args.key or os.environ.get("STEAM_API_KEY") or cfg.get("api_key")
+    ident = args.id or os.environ.get("STEAM_ID") or cfg.get("steam_id")
+    fresh = False
+
+    if not key:
+        if not interactive:
+            die("no API key.",
+                "Supply one with --key, the STEAM_API_KEY environment variable, or run\n"
+                "interactively to be prompted. Get a key at "
+                "https://steamcommunity.com/dev/apikey")
+        key = prompt_key()
+        fresh = True
+    elif not KEY_RE.match(key.strip()):
+        die("the API key is not 32 hex characters.",
+            "Copy it again from https://steamcommunity.com/dev/apikey")
+    key = key.strip()
+
+    if not ident:
+        if not interactive:
+            die("no Steam ID.",
+                "Supply one with --id, the STEAM_ID environment variable, or run\n"
+                "interactively to be prompted.")
+        ident = prompt_identity()
+        fresh = True
+
+    return key, ident, fresh
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="steam-friends",
+        description="List a Steam account's friends sorted by when they were added.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  steam-friends                                  interactive\n"
+            "  steam-friends --id yourvanityname              newest first\n"
+            "  steam-friends --id 7656119999999999 --oldest   oldest first\n"
+            "  steam-friends --format csv -o friends.csv      spreadsheet\n"
+            "  steam-friends --format json | jq '.[0]'        newest friend\n\n"
+            "note: GetFriendList requires the target's \"My friends list\" privacy\n"
+            "setting to be Public, which is separate from overall profile privacy.\n"
+        ),
+    )
+    p.add_argument("--key", metavar="HEX32", help="Steam Web API key")
+    p.add_argument("--id", metavar="ID", help="SteamID64, vanity name, or profile URL")
+    p.add_argument("--relationship", choices=["friend", "all"], default="friend",
+                   help="which entries to list (default: friend)")
+    p.add_argument("--oldest", action="store_true", help="sort oldest first")
+    p.add_argument("--format", choices=["table", "csv", "tsv", "json"], default="table",
+                   help="output format (default: table)")
+    p.add_argument("-o", "--output", metavar="FILE", help="write to FILE instead of stdout")
+    p.add_argument("--limit", type=int, metavar="N", help="show only the first N rows")
+    p.add_argument("--utc", action="store_true", help="timestamps in UTC (default: local)")
+    p.add_argument("--no-names", action="store_true",
+                   help="skip persona-name lookup (one less API call per 100 friends)")
+    p.add_argument("--no-summary", action="store_true", help="omit the per-year breakdown")
+    p.add_argument("--save", action="store_true", help="save key and id to the config file")
+    p.add_argument("--version", action="version", version="steam-friends 1.0")
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.limit is not None and args.limit < 1:
+        die("--limit must be 1 or greater")
+
+    interactive = sys.stdin.isatty() and sys.stderr.isatty()
+    key, ident, fresh = gather_credentials(args, interactive)
+
+    try:
+        steam_id = resolve(ident, key)
+        info(f"fetching friends of {steam_id}…")
+        friends = fetch_friends(steam_id, key, args.relationship)
+
+        if not friends:
+            print(f"No friends returned for {steam_id} "
+                  f"(relationship={args.relationship}).", file=sys.stderr)
+            return 0
+
+        names = {} if args.no_names else fetch_names(
+            [str(f.get("steamid", "")) for f in friends if f.get("steamid")], key)
+
+    except SteamError as e:
+        die(_redact(str(e), key), e.hint)
+    except ValueError as e:
+        die(str(e))
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+    all_rows = build_rows(friends, names, args.utc, args.oldest)
+    total = len(all_rows)
+    rows = all_rows[:args.limit] if args.limit else all_rows
+
+    show_rel = args.relationship == "all"
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8", newline="") as f:
+                write_output(rows, args.format, f, show_rel)
+        except OSError as e:
+            die(f"could not write {args.output}: {e}")
+        info(f"wrote {len(rows)} of {total} rows to {args.output}")
+    else:
+        write_output(rows, args.format, sys.stdout, show_rel)
+        # Flush before touching stderr, or the trailer overtakes a
+        # block-buffered stdout and prints above the table.
+        sys.stdout.flush()
+
+    if args.format == "table" and not args.no_summary:
+        print(render_summary(all_rows, shown=len(rows)), file=sys.stderr)
+    if args.limit and args.limit < total:
+        info(f"showing {len(rows)} of {total}; omit --limit for the rest")
+
+    if fresh and interactive and not args.save:
+        try:
+            if input("\nSave key and id for next time? [y/N] ").strip().lower() in ("y", "yes"):
+                save_config(key, steam_id)
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+    elif args.save:
+        save_config(key, steam_id)
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

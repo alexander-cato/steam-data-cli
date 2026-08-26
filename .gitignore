@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Pulled friend lists contain other people's names and IDs. Never commit them.
+friends_by_date.txt
+*.csv
+*.tsv
