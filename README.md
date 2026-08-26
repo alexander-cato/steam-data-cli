@@ -1,20 +1,19 @@
 # steam-data-cli
 
-Command-line tools for the Steam Web API. One so far: `steam-friends`,
-which lists a Steam account's friends sorted by when they were added.
+Command-line tools for the Steam Web API. 
+Currently just`steam-friends`,
+which lists a Steam account's friends sorted by date added.
 
 One file, Python 3.7+, standard library only.
 
 ## Setup
 
-Get an API key at <https://steamcommunity.com/dev/apikey>. Accounts that have
-never spent $5 can't create one.
+Get an API key at <https://steamcommunity.com/dev/apikey>. 
+Note that limited accounts (Accounts that have never spent $5 can't create one.)
 
-Then set the account's "My friends list" to Public, under Profile → Edit
-Profile → Privacy Settings. This one trips up everyone, me included. Steam
-keeps friends-list privacy separate from profile privacy, so a fully public
-profile still returns HTTP 401 here. Holding the API key doesn't exempt you
-either, even on your own account. Switch it back once you have the data.
+Steam separates friends-list privacy from profile privacy, so a fully public profile still returns HTTP 401. 
+Your API key does not provide privileged access even to your own account. 
+Ensure that the visibility for “My friends list” is set to Public. You can change this at  Profile → Edit.
 
 ## Usage
 
@@ -40,16 +39,15 @@ Credentials come from `--key`/`--id`, then `STEAM_API_KEY`/`STEAM_ID`, then
 
 ## Details
 
-Date added comes from `friend_since`. Steam reports `0` for some friendships,
-mostly old ones. Those rows read `unknown` and sort to the end in both
-directions instead of showing up as 1970.
+Date added comes from `friend_since`. Steam reports `0` for friends added before steam began keeping a date added record.
+Those rows read `unknown` and sort to the end.
 
 Names come from `GetPlayerSummaries`, 100 ids per call. If a batch fails you
 lose those names. The run finishes anyway and those rows show the raw id.
 
 The tool retries on rate limits, 5xx, and network errors, waiting longer each
 time. Bad keys and privacy refusals fail on the first try, because retrying
-can't fix either one.
+won't fix either one.
 
 Data goes to stdout. Progress and warnings go to stderr.
 
