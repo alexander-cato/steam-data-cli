@@ -34,7 +34,10 @@ after exporting the data.
 --match alice             match names or SteamIDs (case-insensitive)
 --since 2024-01-01        added on/after a date; pair with --until
 --state online            filter by Steam presence state
---details                 include status, last logoff, country, game, profile URL
+--country US              filter by two-letter profile country code
+--playing [portal]        friends in a game, optionally matching its name
+--sort name --reverse     sort by name, status, last logoff, or account creation
+--details                 include status, profile, game, identity, and account details
 --limit 20                first 20 rows
 --utc                     UTC instead of local time
 --no-names                skip the persona-name lookup
@@ -55,7 +58,14 @@ end in either direction instead of appearing as dates in 1970.
 Names come from `GetPlayerSummaries`, with up to 100 IDs per call. If a batch
 fails, the command finishes and displays the affected Steam IDs without names.
 The same response powers `--details` and `--state`; both are incompatible with
-`--no-names`, which deliberately skips those requests.
+`--no-names`, which deliberately skips those requests. Profile-backed filters
+and sorting are incompatible with `--no-names` for the same reason.
+
+`--sort added` shows newest friendships first by default. Name and status sorts
+are ascending, while last-logoff and account-creation sorts show the newest
+dates first. `--reverse` flips the selected order. Missing dates and names stay
+at the end in either direction; `--oldest` remains a shorthand for reversing
+the default added-date sort.
 
 The tool retries on rate limits, 5xx, and network errors, waiting longer each
 time. Bad keys and privacy refusals fail on the first try, because retrying

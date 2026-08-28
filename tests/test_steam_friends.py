@@ -125,6 +125,9 @@ class RowBuildingTests(unittest.TestCase):
                 "loccountrycode": "US",
                 "gameextrainfo": "Portal 2",
                 "profileurl": "https://steamcommunity.com/id/alpha/",
+                "realname": "Alice Example",
+                "timecreated": 300,
+                "communityvisibilitystate": 3,
             }
         }
 
@@ -137,6 +140,9 @@ class RowBuildingTests(unittest.TestCase):
         self.assertEqual(row["last_logoff"], "1970-01-01 00:03")
         self.assertEqual(row["country"], "US")
         self.assertEqual(row["game"], "Portal 2")
+        self.assertEqual(row["real_name"], "Alice Example")
+        self.assertEqual(row["account_created"], "1970-01-01 00:05")
+        self.assertEqual(row["visibility"], "public")
 
     def test_filters_by_presence_state(self):
         rows = [
@@ -148,11 +154,59 @@ class RowBuildingTests(unittest.TestCase):
 
         self.assertEqual([row["steamid"] for row in filtered], ["222"])
 
+    def test_filters_by_country_and_current_game(self):
+        rows = [
+            {"added": "", "steamid": "111", "name": "A", "status": "online",
+             "country": "US", "game": "Portal 2"},
+            {"added": "", "steamid": "222", "name": "B", "status": "away",
+             "country": "GB", "game": ""},
+            {"added": "", "steamid": "333", "name": "C", "status": "online",
+             "country": "US", "game": "Half-Life"},
+        ]
+
+        in_game = steam_friends.filter_rows(rows, country="US", playing="")
+        matching_game = steam_friends.filter_rows(rows, playing="PORTAL")
+
+        self.assertEqual([row["steamid"] for row in in_game], ["111", "333"])
+        self.assertEqual([row["steamid"] for row in matching_game], ["111"])
+
+    def test_sorts_profile_fields_and_keeps_missing_values_last(self):
+        rows = [
+            {"steamid": "111", "friend_since": 100, "name": "Zulu",
+             "status": "away", "last_logoff": "2024-01-01 00:00",
+             "account_created_timestamp": 200},
+            {"steamid": "222", "friend_since": 300, "name": "alpha",
+             "status": "online", "last_logoff": "",
+             "account_created_timestamp": 100},
+            {"steamid": "333", "friend_since": 0, "name": "",
+             "status": "offline", "last_logoff": "2025-01-01 00:00",
+             "account_created_timestamp": 0},
+        ]
+
+        by_name = steam_friends.sort_rows(rows, "name")
+        by_recent_logoff = steam_friends.sort_rows(rows, "last-logoff")
+        by_oldest_account = steam_friends.sort_rows(
+            rows, "account-created", reverse=True
+        )
+        by_status = steam_friends.sort_rows(rows, "status")
+
+        self.assertEqual([row["steamid"] for row in by_name], ["222", "111", "333"])
+        self.assertEqual(
+            [row["steamid"] for row in by_recent_logoff], ["333", "111", "222"]
+        )
+        self.assertEqual(
+            [row["steamid"] for row in by_oldest_account], ["222", "111", "333"]
+        )
+        self.assertEqual(
+            [row["steamid"] for row in by_status], ["222", "111", "333"]
+        )
+
     def test_hides_player_details_unless_requested(self):
         row = {
             "added": "", "friend_since": 0, "steamid": "111", "name": "A",
             "relationship": "friend", "status": "online", "last_logoff": "",
             "country": "US", "game": "", "profile_url": "https://example.test/",
+            "real_name": "", "account_created": "", "visibility": "public",
         }
         compact = io.StringIO()
         detailed = io.StringIO()

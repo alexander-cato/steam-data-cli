@@ -65,6 +65,20 @@ PERSONA_STATES = {
     5: "looking-to-trade",
     6: "looking-to-play",
 }
+PROFILE_VISIBILITY = {
+    1: "private",
+    3: "public",
+}
+STATUS_ORDER = {
+    "online": 0,
+    "busy": 1,
+    "away": 2,
+    "snooze": 3,
+    "looking-to-trade": 4,
+    "looking-to-play": 5,
+    "offline": 6,
+    "unknown": 7,
+}
 
 
 # ── terminal helpers ────────────────────────────────────────────────────────
@@ -537,6 +551,16 @@ def build_rows(friends: list, players: dict, utc: bool, oldest_first: bool) -> l
             last_logoff = max(0, int(player.get("lastlogoff") or 0))
         except (TypeError, ValueError):
             last_logoff = 0
+        try:
+            account_created = max(0, int(player.get("timecreated") or 0))
+        except (TypeError, ValueError):
+            account_created = 0
+        try:
+            visibility = PROFILE_VISIBILITY.get(
+                int(player.get("communityvisibilitystate")), "unknown"
+            )
+        except (TypeError, ValueError):
+            visibility = "unknown"
         rows.append({
             "added": fmt_time(ts, utc),
             "friend_since": ts,
@@ -548,6 +572,10 @@ def build_rows(friends: list, players: dict, utc: bool, oldest_first: bool) -> l
             "country": player.get("loccountrycode") or "",
             "game": player.get("gameextrainfo") or "",
             "profile_url": player.get("profileurl") or "",
+            "real_name": player.get("realname") or "",
+            "account_created": fmt_time(account_created, utc),
+            "account_created_timestamp": account_created,
+            "visibility": visibility,
         })
     # Entries with friend_since == 0 carry no date; park them at the end in both
     # directions rather than letting them masquerade as 1970.
@@ -556,6 +584,37 @@ def build_rows(friends: list, players: dict, utc: bool, oldest_first: bool) -> l
     dated.sort(key=lambda r: r["friend_since"], reverse=not oldest_first)
     undated.sort(key=lambda r: r["steamid"])
     return dated + undated
+
+
+def sort_rows(rows: list, field: str, reverse: bool = False) -> list:
+    """Sort rows with absent values consistently parked at the end."""
+    if field == "added":
+        value = lambda row: row["friend_since"]
+        descending = not reverse
+    elif field == "name":
+        value = lambda row: row["name"].casefold()
+        descending = reverse
+    elif field == "status":
+        value = lambda row: STATUS_ORDER.get(row["status"], len(STATUS_ORDER))
+        descending = reverse
+    elif field == "last-logoff":
+        value = lambda row: row["last_logoff"]
+        descending = not reverse
+    elif field == "account-created":
+        value = lambda row: row["account_created_timestamp"]
+        descending = not reverse
+    else:
+        raise ValueError(f"unsupported sort field {field!r}")
+
+    if field == "status":
+        populated = list(rows)
+        missing = []
+    else:
+        populated = [row for row in rows if value(row)]
+        missing = [row for row in rows if not value(row)]
+    populated.sort(key=lambda row: (value(row), row["steamid"]), reverse=descending)
+    missing.sort(key=lambda row: row["steamid"])
+    return populated + missing
 
 
 def parse_date(value: str) -> str:
@@ -576,10 +635,11 @@ def parse_date(value: str) -> str:
 
 def filter_rows(
     rows: list, query: str = "", since: str = "", until: str = "",
-    state: str = "",
+    state: str = "", country: str = "", playing=None,
 ) -> list:
-    """Filter rows by name/id substring and an inclusive friendship date range."""
+    """Filter rows by identity, friendship date, presence, country, and game."""
     needle = query.casefold().strip()
+    game_needle = playing.casefold().strip() if playing is not None else None
     filtered = []
     for row in rows:
         if (needle
@@ -593,6 +653,11 @@ def filter_rows(
             continue
         if state and row["status"] != state:
             continue
+        if country and row["country"].upper() != country:
+            continue
+        if game_needle is not None and (
+                not row["game"] or game_needle not in row["game"].casefold()):
+            continue
         filtered.append(row)
     return filtered
 
@@ -602,7 +667,10 @@ def render_table(rows: list, show_rel: bool, show_details: bool = False) -> str:
         return ""
     headers = ["#", "ADDED", "STEAMID64", "NAME"] + (["REL"] if show_rel else [])
     if show_details:
-        headers += ["STATUS", "LAST LOGOFF", "CC", "GAME", "PROFILE"]
+        headers += [
+            "STATUS", "LAST LOGOFF", "CC", "GAME", "REAL NAME",
+            "ACCOUNT CREATED", "VISIBILITY", "PROFILE",
+        ]
     body = []
     for i, r in enumerate(rows, 1):
         cells = [str(i), r["added"] or "unknown", r["steamid"], r["name"] or "?"]
@@ -611,7 +679,9 @@ def render_table(rows: list, show_rel: bool, show_details: bool = False) -> str:
         if show_details:
             cells += [
                 r["status"], r["last_logoff"] or "unknown", r["country"] or "?",
-                r["game"] or "—", r["profile_url"] or "?",
+                r["game"] or "—", r["real_name"] or "—",
+                r["account_created"] or "unknown", r["visibility"],
+                r["profile_url"] or "?",
             ]
         body.append(cells)
     widths = [
@@ -651,7 +721,10 @@ def output_columns(show_rel: bool, show_details: bool) -> list:
     if show_rel:
         columns.append("relationship")
     if show_details:
-        columns += ["status", "last_logoff", "country", "game", "profile_url"]
+        columns += [
+            "status", "last_logoff", "country", "game", "real_name",
+            "account_created", "visibility", "profile_url",
+        ]
     return columns
 
 
@@ -771,6 +844,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--relationship", choices=["friend", "all"], default="friend",
                    help="which entries to list (default: friend)")
     p.add_argument("--oldest", action="store_true", help="sort oldest first")
+    p.add_argument(
+        "--sort", choices=["added", "name", "status", "last-logoff", "account-created"],
+        default="added", help="field to sort by (default: added)",
+    )
+    p.add_argument("--reverse", action="store_true",
+                   help="reverse the selected sort order")
     p.add_argument("--match", metavar="TEXT",
                    help="only names or SteamIDs containing TEXT (case-insensitive)")
     p.add_argument("--since", type=parse_date, metavar="YYYY-MM-DD",
@@ -779,6 +858,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="only friendships added on or before this date")
     p.add_argument("--state", choices=list(PERSONA_STATES.values()),
                    help="only friends in this Steam presence state")
+    p.add_argument("--country", type=lambda value: value.upper(), metavar="CC",
+                   help="only friends with this two-letter country code")
+    p.add_argument("--playing", nargs="?", const="", metavar="GAME",
+                   help="only friends in a game, optionally matching GAME")
     p.add_argument("--format", choices=["table", "csv", "tsv", "json"], default="table",
                    help="output format (default: table)")
     p.add_argument("-o", "--output", metavar="FILE", help="write to FILE instead of stdout")
@@ -787,7 +870,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-names", action="store_true",
                    help="skip persona-name lookup (one less API call per 100 friends)")
     p.add_argument("--details", action="store_true",
-                   help="include status, last logoff, country, game, and profile URL")
+                   help="include presence, game, identity, account, and profile details")
     p.add_argument("--no-summary", action="store_true", help="omit the per-year breakdown")
     p.add_argument("--save", action="store_true", help="save key and id to the config file")
     p.add_argument("--track", nargs="?", const="", metavar="FILE",
@@ -802,8 +885,16 @@ def main() -> int:
         die("--limit must be 1 or greater")
     if args.since and args.until and args.since > args.until:
         die("--since must not be later than --until")
-    if args.no_names and (args.details or args.state):
-        die("--no-names cannot be combined with --details or --state")
+    if args.oldest and args.sort != "added":
+        die("--oldest can only be used with --sort added")
+    if args.oldest and args.reverse:
+        die("--oldest and --reverse cannot be combined")
+    if args.country and not re.match(r"^[A-Z]{2}$", args.country):
+        die("--country must be a two-letter country code")
+    if args.no_names and (
+            args.details or args.state or args.country or args.playing is not None
+            or args.sort != "added"):
+        die("--no-names cannot be combined with profile filters, details, or profile sorting")
 
     interactive = sys.stdin.isatty() and sys.stderr.isatty()
     key, ident, fresh = gather_credentials(args, interactive)
@@ -829,7 +920,8 @@ def main() -> int:
         return 130
 
     fetched_total = len(friends)
-    all_rows = build_rows(friends, players, args.utc, args.oldest)
+    all_rows = build_rows(friends, players, args.utc, False)
+    all_rows = sort_rows(all_rows, args.sort, args.reverse or args.oldest)
     if args.track is not None:
         snapshot_path = args.track or default_snapshot_path(
             steam_id, args.relationship
@@ -843,7 +935,7 @@ def main() -> int:
         print(snapshot_report, file=sys.stderr)
     all_rows = filter_rows(
         all_rows, args.match or "", args.since or "", args.until or "",
-        args.state or "",
+        args.state or "", args.country or "", args.playing,
     )
     total = len(all_rows)
     rows = all_rows[:args.limit] if args.limit else all_rows
@@ -868,7 +960,8 @@ def main() -> int:
             print(summary, file=sys.stderr)
     if args.limit and args.limit < total:
         info(f"showing {len(rows)} of {total}; omit --limit for the rest")
-    if (args.match or args.since or args.until or args.state) and total != fetched_total:
+    if (args.match or args.since or args.until or args.state or args.country
+            or args.playing is not None) and total != fetched_total:
         info(f"filters matched {total} of {fetched_total} friends")
 
     if fresh and interactive and not args.save:
