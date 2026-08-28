@@ -585,9 +585,7 @@ def fmt_time(ts: int, utc: bool) -> str:
     return time.strftime("%Y-%m-%d %H:%M", fn(ts))
 
 
-def build_rows(
-    friends: list, players: dict, utc: bool, oldest_first: bool, bans=None
-) -> list:
+def build_rows(friends: list, players: dict, utc: bool, bans=None) -> list:
     rows = []
     bans = bans or {}
     for f in friends:
@@ -673,17 +671,15 @@ def build_rows(
             "days_since_last_ban": days_since_last_ban,
             "economy_ban": economy_ban,
         })
-    # Entries with friend_since == 0 carry no date; park them at the end in both
-    # directions rather than letting them masquerade as 1970.
-    dated = [r for r in rows if r["friend_since"]]
-    undated = [r for r in rows if not r["friend_since"]]
-    dated.sort(key=lambda r: r["friend_since"], reverse=not oldest_first)
-    undated.sort(key=lambda r: r["steamid"])
-    return dated + undated
+    return rows
 
 
 def sort_rows(rows: list, field: str, reverse: bool = False) -> list:
-    """Sort rows with absent values consistently parked at the end."""
+    """Sort rows with absent values consistently parked at the end.
+
+    Rows with no friend_since date, name, or logoff go last in both directions
+    rather than masquerading as 1970 or sorting ahead of real values.
+    """
     if field == "added":
         value = lambda row: row["friend_since"]
         descending = not reverse
@@ -794,7 +790,7 @@ def _table_cell(row: dict, column: str) -> str:
     value = row[column]
     if isinstance(value, bool):
         return "yes" if value else "no"
-    if value not in (None, ""):
+    if value not in (None, "") and not (column == "friend_since" and value == 0):
         return str(value)
     if column in ("added", "friend_since", "last_logoff", "account_created"):
         return "unknown"
@@ -1080,7 +1076,7 @@ def main() -> int:
         return 130
 
     fetched_total = len(friends)
-    all_rows = build_rows(friends, players, args.utc, False, bans)
+    all_rows = build_rows(friends, players, args.utc, bans)
     all_rows = sort_rows(all_rows, args.sort, args.reverse or args.oldest)
     if args.track is not None:
         snapshot_path = args.track or default_snapshot_path(

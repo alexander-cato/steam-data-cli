@@ -58,9 +58,10 @@ class RowBuildingTests(unittest.TestCase):
             {"steamid": "1", "friend_since": 100},
             {"steamid": "4", "friend_since": -1},
         ]
+        rows = steam_friends.build_rows(friends, {}, utc=True)
 
-        newest = steam_friends.build_rows(friends, {}, utc=True, oldest_first=False)
-        oldest = steam_friends.build_rows(friends, {}, utc=True, oldest_first=True)
+        newest = steam_friends.sort_rows(rows, "added")
+        oldest = steam_friends.sort_rows(rows, "added", reverse=True)
 
         self.assertEqual([row["steamid"] for row in newest], ["2", "1", "3", "4"])
         self.assertEqual([row["steamid"] for row in oldest], ["1", "2", "3", "4"])
@@ -107,6 +108,20 @@ class RowBuildingTests(unittest.TestCase):
         self.assertIn("#  NAME   LAST LOGOFF", table_output.getvalue())
         self.assertIn("1  Alpha  unknown", table_output.getvalue())
         self.assertNotIn("STEAMID64", table_output.getvalue())
+
+    def test_renders_missing_friend_since_as_unknown(self):
+        rows = steam_friends.build_rows(
+            [{"steamid": "111", "friend_since": 0},
+             {"steamid": "222", "friend_since": 100}],
+            {}, utc=True,
+        )
+
+        table = steam_friends.render_table(
+            rows, show_rel=False, columns=["steamid", "friend_since"]
+        )
+
+        self.assertIn("1  111        unknown", table)
+        self.assertIn("2  222        100", table)
 
     def test_validates_custom_output_columns(self):
         self.assertEqual(
@@ -171,9 +186,7 @@ class RowBuildingTests(unittest.TestCase):
             }
         }
 
-        row = steam_friends.build_rows(
-            friends, players, utc=True, oldest_first=False
-        )[0]
+        row = steam_friends.build_rows(friends, players, utc=True)[0]
 
         self.assertEqual(row["name"], "Alpha")
         self.assertEqual(row["status"], "away")
@@ -235,9 +248,7 @@ class RowBuildingTests(unittest.TestCase):
             }
         }
 
-        row = steam_friends.build_rows(
-            friends, {}, utc=True, oldest_first=False, bans=bans
-        )[0]
+        row = steam_friends.build_rows(friends, {}, utc=True, bans=bans)[0]
 
         self.assertEqual(row["ban_status"], "community,vac,game,economy")
         self.assertTrue(row["community_banned"])
@@ -249,8 +260,7 @@ class RowBuildingTests(unittest.TestCase):
 
     def test_marks_unrequested_ban_data_unknown(self):
         row = steam_friends.build_rows(
-            [{"steamid": "111", "friend_since": 100}], {},
-            utc=True, oldest_first=False,
+            [{"steamid": "111", "friend_since": 100}], {}, utc=True,
         )[0]
 
         self.assertEqual(row["ban_status"], "unknown")
