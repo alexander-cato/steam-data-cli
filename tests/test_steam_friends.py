@@ -79,6 +79,42 @@ class RowBuildingTests(unittest.TestCase):
         steam_friends.write_output([], "csv", csv_output, show_rel=False)
         self.assertEqual(csv_output.getvalue(), "added,friend_since,steamid,name\n")
 
+    def test_filters_by_name_or_id_case_insensitively(self):
+        rows = [
+            {"added": "2024-01-02 12:00", "steamid": "111", "name": "Alpha Fox"},
+            {"added": "2023-08-09 12:00", "steamid": "222", "name": "Beta"},
+            {"added": "", "steamid": "333", "name": "Gamma"},
+        ]
+
+        self.assertEqual(
+            [row["steamid"] for row in steam_friends.filter_rows(rows, query="FOX")],
+            ["111"],
+        )
+        self.assertEqual(
+            [row["steamid"] for row in steam_friends.filter_rows(rows, query="22")],
+            ["222"],
+        )
+
+    def test_filters_by_inclusive_date_range_and_omits_unknown_dates(self):
+        rows = [
+            {"added": "2024-01-02 12:00", "steamid": "111", "name": "Alpha"},
+            {"added": "2023-08-09 12:00", "steamid": "222", "name": "Beta"},
+            {"added": "", "steamid": "333", "name": "Gamma"},
+        ]
+
+        filtered = steam_friends.filter_rows(
+            rows, since="2023-08-09", until="2024-01-02"
+        )
+
+        self.assertEqual([row["steamid"] for row in filtered], ["111", "222"])
+
+    def test_rejects_invalid_filter_dates(self):
+        for value in ("2024-02-30", "02/20/2024", "2024-2-20"):
+            with self.subTest(value=value), self.assertRaises(
+                steam_friends.argparse.ArgumentTypeError
+            ):
+                steam_friends.parse_date(value)
+
 
 class MainTests(unittest.TestCase):
     def test_empty_friend_list_still_writes_output_and_saves_when_requested(self):

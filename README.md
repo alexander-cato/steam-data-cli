@@ -31,6 +31,8 @@ after exporting the data.
 --oldest                  oldest friendships first
 --format csv -o out.csv   also tsv, json, table (default)
 --relationship all        include pending invites
+--match alice             match names or SteamIDs (case-insensitive)
+--since 2024-01-01        added on/after a date; pair with --until
 --limit 20                first 20 rows
 --utc                     UTC instead of local time
 --no-names                skip the persona-name lookup
@@ -56,6 +58,10 @@ won't fix either one.
 
 Data is written to standard output. Progress and warnings are written to
 standard error, so redirecting or piping the data remains safe.
+
+`--since` and `--until` are inclusive and use the selected output timezone
+(local by default, UTC with `--utc`). Friendships without a recorded date are
+left out when either date filter is active.
 
 ## Exit codes
 
