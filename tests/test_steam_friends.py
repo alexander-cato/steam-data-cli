@@ -241,6 +241,29 @@ class SnapshotTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["name"], "Alpha")
 
+    def test_skips_friends_without_a_steamid_so_the_snapshot_stays_readable(self):
+        rows = [
+            {"steamid": "111", "friend_since": 100, "name": "Alpha",
+             "relationship": "friend"},
+            {"steamid": "", "friend_since": 200, "name": "",
+             "relationship": "friend"},
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "friends.json"
+            steam_friends.update_snapshot(
+                str(path), "76561198000000000", "friend", rows
+            )
+            report = steam_friends.update_snapshot(
+                str(path), "76561198000000000", "friend", rows
+            )
+            saved = steam_friends.load_snapshot(
+                str(path), "76561198000000000", "friend"
+            )
+
+        self.assertEqual([f["steamid"] for f in saved["friends"]], ["111"])
+        self.assertIn("0 added, 0 removed, 0 renamed", report)
+
     def test_rejects_a_snapshot_for_a_different_account(self):
         rows = [
             {"steamid": "111", "friend_since": 100, "name": "Alpha",

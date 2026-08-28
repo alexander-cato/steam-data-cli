@@ -299,6 +299,8 @@ def prepare_snapshot_rows(rows: list, previous=None) -> list:
     }
     snapshot_rows = []
     for row in rows:
+        if not row["steamid"]:
+            continue
         old = previous_by_id.get(row["steamid"], {})
         snapshot_rows.append({
             "steamid": row["steamid"],
