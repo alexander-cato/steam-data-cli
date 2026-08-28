@@ -39,6 +39,8 @@ after exporting the data.
 --playing [portal]        friends in a game, optionally matching its name
 --sort name --reverse     sort by name, status, last logoff, or account creation
 --details                 include status, profile, game, identity, and account details
+--bans                    include public VAC, game, community, and economy bans
+--banned-only             show only friends with a reported ban
 --limit 20                first 20 rows
 --utc                     UTC instead of local time
 --no-names                skip the persona-name lookup
@@ -71,8 +73,17 @@ the default added-date sort.
 Use `--columns` to choose fields and their order in any output format. It
 accepts `added`, `friend_since`, `steamid`, `name`, `relationship`, `status`,
 `last_logoff`, `country`, `game`, `real_name`, `account_created`, `visibility`,
-and `profile_url`. Hyphens can be used in place of underscores. The option
-overrides the usual compact or `--details` column preset.
+`profile_url`, `ban_status`, `community_banned`, `vac_banned`, `vac_bans`,
+`game_bans`, `days_since_last_ban`, and `economy_ban`. Hyphens can be used in
+place of underscores. The option overrides the usual compact, `--details`, or
+`--bans` column preset.
+
+`--bans` adds one batched `GetPlayerBans` lookup per 100 friends and exports a
+readable ban status plus the individual community, VAC, game, recency, and
+economy fields. `--banned-only` implies the lookup and excludes both clean and
+unknown records. Selecting a ban column with `--columns`, or sorting by
+`--sort ban-status`, also performs the lookup without adding the full ban
+column preset.
 
 The tool retries on rate limits, 5xx, and network errors, waiting longer each
 time. Bad keys and privacy refusals fail on the first try, because retrying

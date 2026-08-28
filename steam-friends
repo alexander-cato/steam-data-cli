@@ -36,7 +36,7 @@ import urllib.request
 from getpass import getpass
 
 API = "https://api.steampowered.com"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 UA = f"steam-friends/{VERSION} (+stdlib urllib)"
 SUMMARY_BATCH = 100          # Steam's documented max ids per GetPlayerSummaries call
 TIMEOUT = 20                 # seconds per HTTP request
@@ -93,7 +93,19 @@ COLUMN_LABELS = {
     "account_created": "ACCOUNT CREATED",
     "visibility": "VISIBILITY",
     "profile_url": "PROFILE",
+    "ban_status": "BAN STATUS",
+    "community_banned": "COMMUNITY BANNED",
+    "vac_banned": "VAC BANNED",
+    "vac_bans": "VAC BANS",
+    "game_bans": "GAME BANS",
+    "days_since_last_ban": "DAYS SINCE BAN",
+    "economy_ban": "ECONOMY BAN",
 }
+BAN_COLUMNS = [
+    "ban_status", "community_banned", "vac_banned", "vac_bans",
+    "game_bans", "days_since_last_ban", "economy_ban",
+]
+PROFILE_SORTS = {"name", "status", "last-logoff", "account-created"}
 
 
 # ── terminal helpers ────────────────────────────────────────────────────────
@@ -540,6 +552,30 @@ def fetch_players(ids: list, key: str) -> dict:
     return players_by_id
 
 
+def fetch_bans(ids: list, key: str) -> dict:
+    """Map SteamID64 to public ban records, batching at 100 ids per call."""
+    bans_by_id = {}
+    batches = [ids[i:i + SUMMARY_BATCH] for i in range(0, len(ids), SUMMARY_BATCH)]
+    for n, batch in enumerate(batches, 1):
+        if len(batches) > 1:
+            info(f"fetching ban records, batch {n}/{len(batches)}…")
+        try:
+            response = call(
+                "ISteamUser/GetPlayerBans/v1/", key,
+                {"steamids": ",".join(batch)},
+            )
+            players = response.get("players")
+            if not isinstance(players, list):
+                raise SteamError("GetPlayerBans returned an unexpected response shape")
+        except SteamError as e:
+            warn(f"ban lookup batch {n} failed ({e}); those rows show unknown")
+            continue
+        for player in players:
+            if isinstance(player, dict) and player.get("SteamId"):
+                bans_by_id[str(player["SteamId"])] = player
+    return bans_by_id
+
+
 # ── output ──────────────────────────────────────────────────────────────────
 
 def fmt_time(ts: int, utc: bool) -> str:
@@ -549,11 +585,15 @@ def fmt_time(ts: int, utc: bool) -> str:
     return time.strftime("%Y-%m-%d %H:%M", fn(ts))
 
 
-def build_rows(friends: list, players: dict, utc: bool, oldest_first: bool) -> list:
+def build_rows(
+    friends: list, players: dict, utc: bool, oldest_first: bool, bans=None
+) -> list:
     rows = []
+    bans = bans or {}
     for f in friends:
         sid = str(f.get("steamid", ""))
         player = players.get(sid, {})
+        ban = bans.get(sid)
         try:
             ts = max(0, int(f.get("friend_since") or 0))
         except (TypeError, ValueError):
@@ -576,6 +616,40 @@ def build_rows(friends: list, players: dict, utc: bool, oldest_first: bool) -> l
             )
         except (TypeError, ValueError):
             visibility = "unknown"
+        if ban is None:
+            community_banned = None
+            vac_banned = None
+            vac_bans = None
+            game_bans = None
+            days_since_last_ban = None
+            economy_ban = ""
+            ban_status = "unknown"
+        else:
+            community_banned = ban.get("CommunityBanned") is True
+            vac_banned = ban.get("VACBanned") is True
+            try:
+                vac_bans = max(0, int(ban.get("NumberOfVACBans") or 0))
+            except (TypeError, ValueError):
+                vac_bans = 0
+            try:
+                game_bans = max(0, int(ban.get("NumberOfGameBans") or 0))
+            except (TypeError, ValueError):
+                game_bans = 0
+            try:
+                days_since_last_ban = max(0, int(ban.get("DaysSinceLastBan") or 0))
+            except (TypeError, ValueError):
+                days_since_last_ban = 0
+            economy_ban = str(ban.get("EconomyBan") or "none")
+            active = []
+            if community_banned:
+                active.append("community")
+            if vac_banned or vac_bans:
+                active.append("vac")
+            if game_bans:
+                active.append("game")
+            if economy_ban.casefold() != "none":
+                active.append("economy")
+            ban_status = ",".join(active) if active else "clean"
         rows.append({
             "added": fmt_time(ts, utc),
             "friend_since": ts,
@@ -591,6 +665,13 @@ def build_rows(friends: list, players: dict, utc: bool, oldest_first: bool) -> l
             "account_created": fmt_time(account_created, utc),
             "account_created_timestamp": account_created,
             "visibility": visibility,
+            "ban_status": ban_status,
+            "community_banned": community_banned,
+            "vac_banned": vac_banned,
+            "vac_bans": vac_bans,
+            "game_bans": game_bans,
+            "days_since_last_ban": days_since_last_ban,
+            "economy_ban": economy_ban,
         })
     # Entries with friend_since == 0 carry no date; park them at the end in both
     # directions rather than letting them masquerade as 1970.
@@ -618,12 +699,18 @@ def sort_rows(rows: list, field: str, reverse: bool = False) -> list:
     elif field == "account-created":
         value = lambda row: row["account_created_timestamp"]
         descending = not reverse
+    elif field == "ban-status":
+        value = lambda row: row["ban_status"].casefold()
+        descending = reverse
     else:
         raise ValueError(f"unsupported sort field {field!r}")
 
     if field == "status":
         populated = list(rows)
         missing = []
+    elif field == "ban-status":
+        populated = [row for row in rows if row["ban_status"] != "unknown"]
+        missing = [row for row in rows if row["ban_status"] == "unknown"]
     else:
         populated = [row for row in rows if value(row)]
         missing = [row for row in rows if not value(row)]
@@ -674,7 +761,7 @@ def parse_columns(value: str) -> list:
 
 def filter_rows(
     rows: list, query: str = "", since: str = "", until: str = "",
-    state: str = "", country: str = "", playing=None,
+    state: str = "", country: str = "", playing=None, banned_only: bool = False,
 ) -> list:
     """Filter rows by identity, friendship date, presence, country, and game."""
     needle = query.casefold().strip()
@@ -697,12 +784,16 @@ def filter_rows(
         if game_needle is not None and (
                 not row["game"] or game_needle not in row["game"].casefold()):
             continue
+        if banned_only and row["ban_status"] in ("clean", "unknown"):
+            continue
         filtered.append(row)
     return filtered
 
 
 def _table_cell(row: dict, column: str) -> str:
     value = row[column]
+    if isinstance(value, bool):
+        return "yes" if value else "no"
     if value not in (None, ""):
         return str(value)
     if column in ("added", "friend_since", "last_logoff", "account_created"):
@@ -713,7 +804,8 @@ def _table_cell(row: dict, column: str) -> str:
 
 
 def render_table(
-    rows: list, show_rel: bool, show_details: bool = False, columns=None
+    rows: list, show_rel: bool, show_details: bool = False, columns=None,
+    show_bans: bool = False,
 ) -> str:
     if not rows:
         return ""
@@ -726,6 +818,8 @@ def render_table(
                 "status", "last_logoff", "country", "game", "real_name",
                 "account_created", "visibility", "profile_url",
             ]
+        if show_bans:
+            columns += BAN_COLUMNS
     headers = ["#"] + [COLUMN_LABELS[column] for column in columns]
     body = []
     for i, r in enumerate(rows, 1):
@@ -763,7 +857,7 @@ def render_summary(rows: list, shown: int = 0) -> str:
     return "\n".join(lines)
 
 
-def output_columns(show_rel: bool, show_details: bool) -> list:
+def output_columns(show_rel: bool, show_details: bool, show_bans: bool = False) -> list:
     columns = ["added", "friend_since", "steamid", "name"]
     if show_rel:
         columns.append("relationship")
@@ -772,16 +866,18 @@ def output_columns(show_rel: bool, show_details: bool) -> list:
             "status", "last_logoff", "country", "game", "real_name",
             "account_created", "visibility", "profile_url",
         ]
+    if show_bans:
+        columns += BAN_COLUMNS
     return columns
 
 
 def write_output(
     rows: list, fmt: str, dest, show_rel: bool, show_details: bool = False,
-    columns=None,
+    columns=None, show_bans: bool = False,
 ) -> None:
-    selected_columns = columns or output_columns(show_rel, show_details)
+    selected_columns = columns or output_columns(show_rel, show_details, show_bans)
     if fmt == "table":
-        table = render_table(rows, show_rel, show_details, columns)
+        table = render_table(rows, show_rel, show_details, columns, show_bans)
         if table:
             dest.write(table + "\n")
     elif fmt == "json":
@@ -893,7 +989,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="which entries to list (default: friend)")
     p.add_argument("--oldest", action="store_true", help="sort oldest first")
     p.add_argument(
-        "--sort", choices=["added", "name", "status", "last-logoff", "account-created"],
+        "--sort", choices=[
+            "added", "name", "status", "last-logoff", "account-created", "ban-status",
+        ],
         default="added", help="field to sort by (default: added)",
     )
     p.add_argument("--reverse", action="store_true",
@@ -921,6 +1019,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip persona-name lookup (one less API call per 100 friends)")
     p.add_argument("--details", action="store_true",
                    help="include presence, game, identity, account, and profile details")
+    p.add_argument("--bans", action="store_true",
+                   help="include public community, VAC, game, and economy ban data")
+    p.add_argument("--banned-only", action="store_true",
+                   help="only friends with a reported ban")
     p.add_argument("--no-summary", action="store_true", help="omit the per-year breakdown")
     p.add_argument("--save", action="store_true", help="save key and id to the config file")
     p.add_argument("--track", nargs="?", const="", metavar="FILE",
@@ -943,8 +1045,13 @@ def main() -> int:
         die("--country must be a two-letter country code")
     if args.no_names and (
             args.details or args.state or args.country or args.playing is not None
-            or args.sort != "added"):
+            or args.sort in PROFILE_SORTS):
         die("--no-names cannot be combined with profile filters, details, or profile sorting")
+
+    needs_bans = (
+        args.bans or args.banned_only or args.sort == "ban-status"
+        or bool(args.columns and any(column in BAN_COLUMNS for column in args.columns))
+    )
 
     interactive = sys.stdin.isatty() and sys.stderr.isatty()
     key, ident, fresh = gather_credentials(args, interactive)
@@ -960,6 +1067,9 @@ def main() -> int:
 
         players = {} if args.no_names else fetch_players(
             [str(f.get("steamid", "")) for f in friends if f.get("steamid")], key)
+        bans = fetch_bans(
+            [str(f.get("steamid", "")) for f in friends if f.get("steamid")], key
+        ) if needs_bans else {}
 
     except SteamError as e:
         die(_redact(str(e), key), e.hint)
@@ -970,7 +1080,7 @@ def main() -> int:
         return 130
 
     fetched_total = len(friends)
-    all_rows = build_rows(friends, players, args.utc, False)
+    all_rows = build_rows(friends, players, args.utc, False, bans)
     all_rows = sort_rows(all_rows, args.sort, args.reverse or args.oldest)
     if args.track is not None:
         snapshot_path = args.track or default_snapshot_path(
@@ -985,7 +1095,7 @@ def main() -> int:
         print(snapshot_report, file=sys.stderr)
     all_rows = filter_rows(
         all_rows, args.match or "", args.since or "", args.until or "",
-        args.state or "", args.country or "", args.playing,
+        args.state or "", args.country or "", args.playing, args.banned_only,
     )
     total = len(all_rows)
     rows = all_rows[:args.limit] if args.limit else all_rows
@@ -995,14 +1105,16 @@ def main() -> int:
         try:
             with open(args.output, "w", encoding="utf-8", newline="") as f:
                 write_output(
-                    rows, args.format, f, show_rel, args.details, args.columns
+                    rows, args.format, f, show_rel, args.details, args.columns,
+                    args.bans,
                 )
         except OSError as e:
             die(f"could not write {args.output}: {e}")
         info(f"wrote {len(rows)} of {total} rows to {args.output}")
     else:
         write_output(
-            rows, args.format, sys.stdout, show_rel, args.details, args.columns
+            rows, args.format, sys.stdout, show_rel, args.details, args.columns,
+            args.bans,
         )
         # Flush before touching stderr, or the trailer overtakes a
         # block-buffered stdout and prints above the table.
@@ -1015,7 +1127,7 @@ def main() -> int:
     if args.limit and args.limit < total:
         info(f"showing {len(rows)} of {total}; omit --limit for the rest")
     if (args.match or args.since or args.until or args.state or args.country
-            or args.playing is not None) and total != fetched_total:
+            or args.playing is not None or args.banned_only) and total != fetched_total:
         info(f"filters matched {total} of {fetched_total} friends")
 
     if fresh and interactive and not args.save:

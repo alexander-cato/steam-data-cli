@@ -210,6 +210,52 @@ class RowBuildingTests(unittest.TestCase):
         self.assertEqual([row["steamid"] for row in in_game], ["111", "333"])
         self.assertEqual([row["steamid"] for row in matching_game], ["111"])
 
+    def test_filters_to_reported_bans(self):
+        rows = [
+            {"added": "", "steamid": "111", "name": "A", "status": "offline",
+             "country": "", "game": "", "ban_status": "vac"},
+            {"added": "", "steamid": "222", "name": "B", "status": "offline",
+             "country": "", "game": "", "ban_status": "clean"},
+            {"added": "", "steamid": "333", "name": "C", "status": "unknown",
+             "country": "", "game": "", "ban_status": "unknown"},
+        ]
+
+        filtered = steam_friends.filter_rows(rows, banned_only=True)
+
+        self.assertEqual([row["steamid"] for row in filtered], ["111"])
+
+    def test_includes_public_ban_details(self):
+        friends = [{"steamid": "111", "friend_since": 100}]
+        bans = {
+            "111": {
+                "SteamId": "111", "CommunityBanned": True,
+                "VACBanned": True, "NumberOfVACBans": 2,
+                "DaysSinceLastBan": 45, "NumberOfGameBans": 1,
+                "EconomyBan": "probation",
+            }
+        }
+
+        row = steam_friends.build_rows(
+            friends, {}, utc=True, oldest_first=False, bans=bans
+        )[0]
+
+        self.assertEqual(row["ban_status"], "community,vac,game,economy")
+        self.assertTrue(row["community_banned"])
+        self.assertTrue(row["vac_banned"])
+        self.assertEqual(row["vac_bans"], 2)
+        self.assertEqual(row["game_bans"], 1)
+        self.assertEqual(row["days_since_last_ban"], 45)
+        self.assertEqual(row["economy_ban"], "probation")
+
+    def test_marks_unrequested_ban_data_unknown(self):
+        row = steam_friends.build_rows(
+            [{"steamid": "111", "friend_since": 100}], {},
+            utc=True, oldest_first=False,
+        )[0]
+
+        self.assertEqual(row["ban_status"], "unknown")
+        self.assertIsNone(row["vac_banned"])
+
     def test_sorts_profile_fields_and_keeps_missing_values_last(self):
         rows = [
             {"steamid": "111", "friend_since": 100, "name": "Zulu",
@@ -279,6 +325,30 @@ class PlayerFetchingTests(unittest.TestCase):
 
         self.assertEqual(call.call_count, 2)
         self.assertEqual(players["100"]["personaname"], "Player 100")
+
+    def test_preserves_ban_records_across_batches(self):
+        ids = [str(index) for index in range(101)]
+
+        def fake_call(endpoint, key, params):
+            self.assertEqual(endpoint, "ISteamUser/GetPlayerBans/v1/")
+            players = [
+                {
+                    "SteamId": steam_id, "CommunityBanned": False,
+                    "VACBanned": False, "NumberOfVACBans": 0,
+                    "DaysSinceLastBan": 0, "NumberOfGameBans": 0,
+                    "EconomyBan": "none",
+                }
+                for steam_id in params["steamids"].split(",")
+            ]
+            return {"players": players}
+
+        with redirect_stderr(io.StringIO()), mock.patch.object(
+            steam_friends, "call", side_effect=fake_call
+        ) as call:
+            bans = steam_friends.fetch_bans(ids, "a" * 32)
+
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(bans["100"]["EconomyBan"], "none")
 
 
 class SnapshotTests(unittest.TestCase):
@@ -441,6 +511,59 @@ class MainTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(len(saved["friends"]), 1)
         self.assertIn("snapshot baseline saved: 1 friend", stderr.getvalue())
+
+    def test_banned_only_fetches_records_and_filters_clean_friends(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        steam_id = "76561198000000000"
+        friends = [
+            {"steamid": "111", "friend_since": 100, "relationship": "friend"},
+            {"steamid": "222", "friend_since": 200, "relationship": "friend"},
+        ]
+        bans = {
+            "111": {
+                "SteamId": "111", "CommunityBanned": False,
+                "VACBanned": True, "NumberOfVACBans": 1,
+                "DaysSinceLastBan": 10, "NumberOfGameBans": 0,
+                "EconomyBan": "none",
+            },
+            "222": {
+                "SteamId": "222", "CommunityBanned": False,
+                "VACBanned": False, "NumberOfVACBans": 0,
+                "DaysSinceLastBan": 0, "NumberOfGameBans": 0,
+                "EconomyBan": "none",
+            },
+        }
+        argv = [
+            "steam-friends", "--no-names", "--no-summary", "--format", "json",
+            "--banned-only",
+        ]
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(steam_friends.sys, "argv", argv))
+            stack.enter_context(mock.patch.object(steam_friends.sys, "stdout", stdout))
+            stack.enter_context(mock.patch.object(steam_friends.sys, "stderr", stderr))
+            stack.enter_context(mock.patch.object(
+                steam_friends, "gather_credentials",
+                return_value=("a" * 32, steam_id, False),
+            ))
+            stack.enter_context(
+                mock.patch.object(steam_friends, "resolve", return_value=steam_id)
+            )
+            stack.enter_context(
+                mock.patch.object(steam_friends, "fetch_friends", return_value=friends)
+            )
+            fetch_bans = stack.enter_context(
+                mock.patch.object(steam_friends, "fetch_bans", return_value=bans)
+            )
+            result = steam_friends.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [row["steamid"] for row in json.loads(stdout.getvalue())], ["111"]
+        )
+        fetch_bans.assert_called_once_with(["111", "222"], "a" * 32)
+        self.assertIn("filters matched 1 of 2 friends", stderr.getvalue())
 
 
 class ConfigTests(unittest.TestCase):
