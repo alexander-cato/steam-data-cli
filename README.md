@@ -1,36 +1,40 @@
 # steam-data-cli
 
-Command-line tools for the Steam Web API. 
-Currently just`steam-friends`,
-which lists a Steam account's friends sorted by date added.
+Command-line tools for the Steam Web API. Currently, the repository contains
+`steam-friends`, which lists a Steam account's friends by the date they were
+added.
 
-One file, Python 3.7+, standard library only.
+The command is a single executable file, supports Python 3.7+, and uses only
+the standard library.
 
 ## Setup
 
-Get an API key at <https://steamcommunity.com/dev/apikey>. 
-Note that limited accounts (Accounts that have never spent $5 can't create one.)
+Get an API key at <https://steamcommunity.com/dev/apikey>. Limited accounts
+(those that have never spent $5) cannot create one.
 
-Steam separates friends-list privacy from profile privacy, so a fully public profile still returns HTTP 401. 
-Your API key does not provide privileged access even to your own account. 
-Ensure that the visibility for “My friends list” is set to Public. You can change this at  Profile → Edit.
+Set the account's “My friends list” visibility to Public under Profile → Edit
+Profile → Privacy Settings. Steam manages friends-list privacy separately from
+profile privacy, so a public profile can still return HTTP 401. An API key does
+not bypass this setting, even for your own account. You can restore the setting
+after exporting the data.
 
 ## Usage
 
 ```sh
-./steam-friends                                # prompts for what it needs
-./steam-friends --id yourvanityname                 # vanity name
-./steam-friends --id 76561198000000000         # SteamID64
+./steam-friends                                         # prompts for required values
+./steam-friends --id yourvanityname                     # vanity name
+./steam-friends --id 76561198000000000                  # SteamID64
 ./steam-friends --id https://steamcommunity.com/id/yourvanityname/
 ```
 
-```
+```text
 --oldest                  oldest friendships first
 --format csv -o out.csv   also tsv, json, table (default)
 --relationship all        include pending invites
 --limit 20                first 20 rows
 --utc                     UTC instead of local time
 --no-names                skip the persona-name lookup
+--no-summary              omit the per-year summary
 --save                    write the key and id to the config file
 ```
 
@@ -39,18 +43,28 @@ Credentials come from `--key`/`--id`, then `STEAM_API_KEY`/`STEAM_ID`, then
 
 ## Details
 
-Date added comes from `friend_since`. Steam reports `0` for friends added before steam began keeping a date added record.
-Those rows read `unknown` and sort to the end.
+The date added comes from `friend_since`. Steam reports `0` for some
+friendships, mostly older ones. Those rows display `unknown` and sort to the
+end in either direction instead of appearing as dates in 1970.
 
-Names come from `GetPlayerSummaries`, 100 ids per call. If a batch fails you
-lose those names. The run finishes anyway and those rows show the raw id.
+Names come from `GetPlayerSummaries`, with up to 100 IDs per call. If a batch
+fails, the command finishes and displays the affected Steam IDs without names.
 
 The tool retries on rate limits, 5xx, and network errors, waiting longer each
 time. Bad keys and privacy refusals fail on the first try, because retrying
 won't fix either one.
 
-Data goes to stdout. Progress and warnings go to stderr.
+Data is written to standard output. Progress and warnings are written to
+standard error, so redirecting or piping the data remains safe.
 
 ## Exit codes
 
 `0` success, `1` error, `2` bad usage, `130` interrupted.
+
+## Development
+
+The test suite uses only the Python standard library:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
