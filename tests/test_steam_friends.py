@@ -115,6 +115,77 @@ class RowBuildingTests(unittest.TestCase):
             ):
                 steam_friends.parse_date(value)
 
+    def test_includes_optional_player_details(self):
+        friends = [{"steamid": "111", "friend_since": 100}]
+        players = {
+            "111": {
+                "personaname": "Alpha",
+                "personastate": 3,
+                "lastlogoff": 200,
+                "loccountrycode": "US",
+                "gameextrainfo": "Portal 2",
+                "profileurl": "https://steamcommunity.com/id/alpha/",
+            }
+        }
+
+        row = steam_friends.build_rows(
+            friends, players, utc=True, oldest_first=False
+        )[0]
+
+        self.assertEqual(row["name"], "Alpha")
+        self.assertEqual(row["status"], "away")
+        self.assertEqual(row["last_logoff"], "1970-01-01 00:03")
+        self.assertEqual(row["country"], "US")
+        self.assertEqual(row["game"], "Portal 2")
+
+    def test_filters_by_presence_state(self):
+        rows = [
+            {"added": "", "steamid": "111", "name": "A", "status": "online"},
+            {"added": "", "steamid": "222", "name": "B", "status": "away"},
+        ]
+
+        filtered = steam_friends.filter_rows(rows, state="away")
+
+        self.assertEqual([row["steamid"] for row in filtered], ["222"])
+
+    def test_hides_player_details_unless_requested(self):
+        row = {
+            "added": "", "friend_since": 0, "steamid": "111", "name": "A",
+            "relationship": "friend", "status": "online", "last_logoff": "",
+            "country": "US", "game": "", "profile_url": "https://example.test/",
+        }
+        compact = io.StringIO()
+        detailed = io.StringIO()
+
+        steam_friends.write_output([row], "json", compact, show_rel=False)
+        steam_friends.write_output(
+            [row], "json", detailed, show_rel=False, show_details=True
+        )
+
+        self.assertNotIn("status", json.loads(compact.getvalue())[0])
+        self.assertEqual(json.loads(detailed.getvalue())[0]["status"], "online")
+
+
+class PlayerFetchingTests(unittest.TestCase):
+    def test_preserves_full_player_summaries_across_batches(self):
+        ids = [str(index) for index in range(101)]
+
+        def fake_call(endpoint, key, params):
+            self.assertEqual(endpoint, "ISteamUser/GetPlayerSummaries/v2/")
+            players = [
+                {"steamid": steam_id, "personaname": f"Player {steam_id}"}
+                for steam_id in params["steamids"].split(",")
+            ]
+            return {"response": {"players": players}}
+
+        with redirect_stderr(io.StringIO()), mock.patch.object(
+            steam_friends, "call", side_effect=fake_call
+        ) as call:
+            players = steam_friends.fetch_players(ids, "a" * 32)
+
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(players["100"]["personaname"], "Player 100")
+
 
 class MainTests(unittest.TestCase):
     def test_empty_friend_list_still_writes_output_and_saves_when_requested(self):

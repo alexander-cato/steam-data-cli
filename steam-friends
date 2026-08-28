@@ -49,6 +49,15 @@ KEY_RE = re.compile(r"^[0-9A-Fa-f]{32}$")
 ID64_RE = re.compile(r"^7656119[0-9]{10}$")
 VANITY_RE = re.compile(r"^[A-Za-z0-9_.\-]{2,64}$")
 PROFILE_HOSTS = {"steamcommunity.com", "www.steamcommunity.com"}
+PERSONA_STATES = {
+    0: "offline",
+    1: "online",
+    2: "busy",
+    3: "away",
+    4: "snooze",
+    5: "looking-to-trade",
+    6: "looking-to-play",
+}
 
 
 # ── terminal helpers ────────────────────────────────────────────────────────
@@ -323,13 +332,13 @@ def fetch_friends(steam_id: str, key: str, relationship: str) -> list:
     return friends
 
 
-def fetch_names(ids: list, key: str) -> dict:
-    """Map SteamID64 → persona name, batching at Steam's 100-id limit."""
-    names = {}
+def fetch_players(ids: list, key: str) -> dict:
+    """Map SteamID64 to player summaries, batching at Steam's 100-id limit."""
+    players_by_id = {}
     batches = [ids[i:i + SUMMARY_BATCH] for i in range(0, len(ids), SUMMARY_BATCH)]
     for n, batch in enumerate(batches, 1):
         if len(batches) > 1:
-            info(f"fetching names, batch {n}/{len(batches)}…")
+            info(f"fetching profiles, batch {n}/{len(batches)}…")
         try:
             resp = call("ISteamUser/GetPlayerSummaries/v2/", key,
                         {"steamids": ",".join(batch)})
@@ -338,12 +347,12 @@ def fetch_names(ids: list, key: str) -> dict:
             if not isinstance(players, list):
                 raise SteamError("GetPlayerSummaries returned an unexpected response shape")
         except SteamError as e:
-            warn(f"name lookup batch {n} failed ({e}); those rows show the raw id")
+            warn(f"profile lookup batch {n} failed ({e}); those rows show the raw id")
             continue
         for p in players:
             if isinstance(p, dict) and p.get("steamid"):
-                names[p["steamid"]] = p.get("personaname") or ""
-    return names
+                players_by_id[p["steamid"]] = p
+    return players_by_id
 
 
 # ── output ──────────────────────────────────────────────────────────────────
@@ -355,20 +364,34 @@ def fmt_time(ts: int, utc: bool) -> str:
     return time.strftime("%Y-%m-%d %H:%M", fn(ts))
 
 
-def build_rows(friends: list, names: dict, utc: bool, oldest_first: bool) -> list:
+def build_rows(friends: list, players: dict, utc: bool, oldest_first: bool) -> list:
     rows = []
     for f in friends:
         sid = str(f.get("steamid", ""))
+        player = players.get(sid, {})
         try:
             ts = max(0, int(f.get("friend_since") or 0))
         except (TypeError, ValueError):
             ts = 0
+        try:
+            state = PERSONA_STATES.get(int(player.get("personastate")), "unknown")
+        except (TypeError, ValueError):
+            state = "unknown"
+        try:
+            last_logoff = max(0, int(player.get("lastlogoff") or 0))
+        except (TypeError, ValueError):
+            last_logoff = 0
         rows.append({
             "added": fmt_time(ts, utc),
             "friend_since": ts,
             "steamid": sid,
-            "name": names.get(sid) or "",
+            "name": player.get("personaname") or "",
             "relationship": f.get("relationship") or "",
+            "status": state,
+            "last_logoff": fmt_time(last_logoff, utc),
+            "country": player.get("loccountrycode") or "",
+            "game": player.get("gameextrainfo") or "",
+            "profile_url": player.get("profileurl") or "",
         })
     # Entries with friend_since == 0 carry no date; park them at the end in both
     # directions rather than letting them masquerade as 1970.
@@ -396,7 +419,8 @@ def parse_date(value: str) -> str:
 
 
 def filter_rows(
-    rows: list, query: str = "", since: str = "", until: str = ""
+    rows: list, query: str = "", since: str = "", until: str = "",
+    state: str = "",
 ) -> list:
     """Filter rows by name/id substring and an inclusive friendship date range."""
     needle = query.casefold().strip()
@@ -411,19 +435,28 @@ def filter_rows(
             continue
         if until and (not added_date or added_date > until):
             continue
+        if state and row["status"] != state:
+            continue
         filtered.append(row)
     return filtered
 
 
-def render_table(rows: list, show_rel: bool) -> str:
+def render_table(rows: list, show_rel: bool, show_details: bool = False) -> str:
     if not rows:
         return ""
     headers = ["#", "ADDED", "STEAMID64", "NAME"] + (["REL"] if show_rel else [])
+    if show_details:
+        headers += ["STATUS", "LAST LOGOFF", "CC", "GAME", "PROFILE"]
     body = []
     for i, r in enumerate(rows, 1):
         cells = [str(i), r["added"] or "unknown", r["steamid"], r["name"] or "?"]
         if show_rel:
             cells.append(r["relationship"])
+        if show_details:
+            cells += [
+                r["status"], r["last_logoff"] or "unknown", r["country"] or "?",
+                r["game"] or "—", r["profile_url"] or "?",
+            ]
         body.append(cells)
     widths = [
         max(display_width(h), max(display_width(c[i]) for c in body))
@@ -457,18 +490,30 @@ def render_summary(rows: list, shown: int = 0) -> str:
     return "\n".join(lines)
 
 
-def write_output(rows: list, fmt: str, dest, show_rel: bool) -> None:
+def output_columns(show_rel: bool, show_details: bool) -> list:
+    columns = ["added", "friend_since", "steamid", "name"]
+    if show_rel:
+        columns.append("relationship")
+    if show_details:
+        columns += ["status", "last_logoff", "country", "game", "profile_url"]
+    return columns
+
+
+def write_output(
+    rows: list, fmt: str, dest, show_rel: bool, show_details: bool = False
+) -> None:
+    columns = output_columns(show_rel, show_details)
     if fmt == "table":
-        table = render_table(rows, show_rel)
+        table = render_table(rows, show_rel, show_details)
         if table:
             dest.write(table + "\n")
     elif fmt == "json":
-        json.dump([{k: v for k, v in r.items() if k != "relationship" or show_rel}
-                   for r in rows], dest, indent=2, ensure_ascii=False)
+        json.dump([{key: row[key] for key in columns} for row in rows], dest,
+                  indent=2, ensure_ascii=False)
         dest.write("\n")
     elif fmt in ("csv", "tsv"):
-        cols = ["added", "friend_since", "steamid", "name"] + (["relationship"] if show_rel else [])
-        w = csv.DictWriter(dest, fieldnames=cols, delimiter="\t" if fmt == "tsv" else ",",
+        w = csv.DictWriter(dest, fieldnames=columns,
+                           delimiter="\t" if fmt == "tsv" else ",",
                            extrasaction="ignore", lineterminator="\n")
         w.writeheader()
         w.writerows(rows)
@@ -576,6 +621,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="only friendships added on or after this date")
     p.add_argument("--until", type=parse_date, metavar="YYYY-MM-DD",
                    help="only friendships added on or before this date")
+    p.add_argument("--state", choices=list(PERSONA_STATES.values()),
+                   help="only friends in this Steam presence state")
     p.add_argument("--format", choices=["table", "csv", "tsv", "json"], default="table",
                    help="output format (default: table)")
     p.add_argument("-o", "--output", metavar="FILE", help="write to FILE instead of stdout")
@@ -583,6 +630,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--utc", action="store_true", help="timestamps in UTC (default: local)")
     p.add_argument("--no-names", action="store_true",
                    help="skip persona-name lookup (one less API call per 100 friends)")
+    p.add_argument("--details", action="store_true",
+                   help="include status, last logoff, country, game, and profile URL")
     p.add_argument("--no-summary", action="store_true", help="omit the per-year breakdown")
     p.add_argument("--save", action="store_true", help="save key and id to the config file")
     p.add_argument("--version", action="version", version="steam-friends 1.0")
@@ -595,6 +644,8 @@ def main() -> int:
         die("--limit must be 1 or greater")
     if args.since and args.until and args.since > args.until:
         die("--since must not be later than --until")
+    if args.no_names and (args.details or args.state):
+        die("--no-names cannot be combined with --details or --state")
 
     interactive = sys.stdin.isatty() and sys.stderr.isatty()
     key, ident, fresh = gather_credentials(args, interactive)
@@ -608,7 +659,7 @@ def main() -> int:
             info(f"no friends returned for {steam_id} "
                  f"(relationship={args.relationship})")
 
-        names = {} if args.no_names else fetch_names(
+        players = {} if args.no_names else fetch_players(
             [str(f.get("steamid", "")) for f in friends if f.get("steamid")], key)
 
     except SteamError as e:
@@ -620,9 +671,10 @@ def main() -> int:
         return 130
 
     fetched_total = len(friends)
-    all_rows = build_rows(friends, names, args.utc, args.oldest)
+    all_rows = build_rows(friends, players, args.utc, args.oldest)
     all_rows = filter_rows(
-        all_rows, args.match or "", args.since or "", args.until or ""
+        all_rows, args.match or "", args.since or "", args.until or "",
+        args.state or "",
     )
     total = len(all_rows)
     rows = all_rows[:args.limit] if args.limit else all_rows
@@ -631,12 +683,12 @@ def main() -> int:
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8", newline="") as f:
-                write_output(rows, args.format, f, show_rel)
+                write_output(rows, args.format, f, show_rel, args.details)
         except OSError as e:
             die(f"could not write {args.output}: {e}")
         info(f"wrote {len(rows)} of {total} rows to {args.output}")
     else:
-        write_output(rows, args.format, sys.stdout, show_rel)
+        write_output(rows, args.format, sys.stdout, show_rel, args.details)
         # Flush before touching stderr, or the trailer overtakes a
         # block-buffered stdout and prints above the table.
         sys.stdout.flush()
@@ -647,7 +699,7 @@ def main() -> int:
             print(summary, file=sys.stderr)
     if args.limit and args.limit < total:
         info(f"showing {len(rows)} of {total}; omit --limit for the rest")
-    if (args.match or args.since or args.until) and total != fetched_total:
+    if (args.match or args.since or args.until or args.state) and total != fetched_total:
         info(f"filters matched {total} of {fetched_total} friends")
 
     if fresh and interactive and not args.save:

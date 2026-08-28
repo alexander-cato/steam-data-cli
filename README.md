@@ -33,6 +33,8 @@ after exporting the data.
 --relationship all        include pending invites
 --match alice             match names or SteamIDs (case-insensitive)
 --since 2024-01-01        added on/after a date; pair with --until
+--state online            filter by Steam presence state
+--details                 include status, last logoff, country, game, profile URL
 --limit 20                first 20 rows
 --utc                     UTC instead of local time
 --no-names                skip the persona-name lookup
@@ -51,6 +53,8 @@ end in either direction instead of appearing as dates in 1970.
 
 Names come from `GetPlayerSummaries`, with up to 100 IDs per call. If a batch
 fails, the command finishes and displays the affected Steam IDs without names.
+The same response powers `--details` and `--state`; both are incompatible with
+`--no-names`, which deliberately skips those requests.
 
 The tool retries on rate limits, 5xx, and network errors, waiting longer each
 time. Bad keys and privacy refusals fail on the first try, because retrying
