@@ -27,6 +27,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -35,7 +36,8 @@ import urllib.request
 from getpass import getpass
 
 API = "https://api.steampowered.com"
-UA = "steam-friends/1.0 (+stdlib urllib)"
+VERSION = "1.1.0"
+UA = f"steam-friends/{VERSION} (+stdlib urllib)"
 SUMMARY_BATCH = 100          # Steam's documented max ids per GetPlayerSummaries call
 TIMEOUT = 20                 # seconds per HTTP request
 RETRIES = 4                  # attempts for transient failures
@@ -44,6 +46,11 @@ CONFIG_DIR = os.path.join(
     "steam-friends",
 )
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "steam-friends",
+)
+SNAPSHOT_DIR = os.path.join(STATE_DIR, "snapshots")
 
 KEY_RE = re.compile(r"^[0-9A-Fa-f]{32}$")
 ID64_RE = re.compile(r"^7656119[0-9]{10}$")
@@ -113,6 +120,10 @@ class SteamError(Exception):
         super().__init__(message)
         self.status = status
         self.hint = hint
+
+
+class SnapshotError(Exception):
+    pass
 
 
 def _redact(text: str, secret: str) -> str:
@@ -235,6 +246,149 @@ def save_config(key: str, steam_id: str) -> None:
         info(f"saved to {CONFIG_PATH} (mode 0600)")
     except OSError as e:
         warn(f"could not save config: {e}")
+
+
+# ── snapshots ───────────────────────────────────────────────────────────────
+
+def default_snapshot_path(steam_id: str, relationship: str) -> str:
+    return os.path.join(SNAPSHOT_DIR, f"{steam_id}-{relationship}.json")
+
+
+def load_snapshot(path: str, steam_id: str, relationship: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
+        raise SnapshotError(f"could not read snapshot {path}: {e}")
+
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise SnapshotError(f"{path} is not a supported steam-friends snapshot")
+    if data.get("steam_id") != steam_id:
+        raise SnapshotError(
+            f"{path} belongs to SteamID64 {data.get('steam_id')!r}, not {steam_id}"
+        )
+    if data.get("relationship") != relationship:
+        raise SnapshotError(
+            f"{path} tracks relationship={data.get('relationship')!r}, "
+            f"not {relationship!r}"
+        )
+    if not isinstance(data.get("captured_at"), int):
+        raise SnapshotError(f"{path} has an invalid captured_at timestamp")
+    friends = data.get("friends")
+    if not isinstance(friends, list):
+        raise SnapshotError(f"{path} has no valid friends list")
+    seen_ids = set()
+    for friend in friends:
+        if (not isinstance(friend, dict)
+                or not isinstance(friend.get("steamid"), str)
+                or not friend["steamid"]
+                or friend["steamid"] in seen_ids
+                or not isinstance(friend.get("friend_since"), int)
+                or not isinstance(friend.get("name"), str)
+                or not isinstance(friend.get("relationship"), str)):
+            raise SnapshotError(f"{path} contains an invalid friend entry")
+        seen_ids.add(friend["steamid"])
+    return data
+
+
+def prepare_snapshot_rows(rows: list, previous=None) -> list:
+    previous_by_id = {
+        row["steamid"]: row for row in (previous or {}).get("friends", [])
+    }
+    snapshot_rows = []
+    for row in rows:
+        old = previous_by_id.get(row["steamid"], {})
+        snapshot_rows.append({
+            "steamid": row["steamid"],
+            "friend_since": row["friend_since"],
+            "name": row["name"] or old.get("name", ""),
+            "relationship": row["relationship"],
+        })
+    return sorted(snapshot_rows, key=lambda row: row["steamid"])
+
+
+def compare_snapshot_rows(previous: list, current: list) -> dict:
+    old_by_id = {row["steamid"]: row for row in previous}
+    new_by_id = {row["steamid"]: row for row in current}
+    added = [new_by_id[sid] for sid in sorted(new_by_id.keys() - old_by_id.keys())]
+    removed = [old_by_id[sid] for sid in sorted(old_by_id.keys() - new_by_id.keys())]
+    renamed = []
+    for sid in sorted(old_by_id.keys() & new_by_id.keys()):
+        old_name = old_by_id[sid]["name"]
+        new_name = new_by_id[sid]["name"]
+        if old_name and new_name and old_name != new_name:
+            renamed.append((old_by_id[sid], new_by_id[sid]))
+    return {"added": added, "removed": removed, "renamed": renamed}
+
+
+def _snapshot_identity(row: dict) -> str:
+    return f"{row['name']} ({row['steamid']})" if row["name"] else row["steamid"]
+
+
+def render_snapshot_changes(changes: dict, captured_at: int) -> str:
+    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(captured_at))
+    counts = (
+        f"{len(changes['added'])} added, {len(changes['removed'])} removed, "
+        f"{len(changes['renamed'])} renamed"
+    )
+    lines = [f"friend changes since {when}: {counts}"]
+    lines += [f"  + {_snapshot_identity(row)}" for row in changes["added"]]
+    lines += [f"  - {_snapshot_identity(row)}" for row in changes["removed"]]
+    lines += [
+        f"  ~ {old['name']} → {new['name']} ({old['steamid']})"
+        for old, new in changes["renamed"]
+    ]
+    return "\n".join(lines)
+
+
+def save_snapshot(
+    path: str, steam_id: str, relationship: str, friends: list,
+    captured_at: int = None,
+) -> None:
+    data = {
+        "version": 1,
+        "steam_id": steam_id,
+        "relationship": relationship,
+        "captured_at": int(time.time()) if captured_at is None else captured_at,
+        "friends": friends,
+    }
+    directory = os.path.dirname(os.path.abspath(path))
+    temporary_path = ""
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory,
+            prefix=".steam-friends-", delete=False,
+        ) as f:
+            temporary_path = f.name
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    except OSError as e:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        raise SnapshotError(f"could not save snapshot {path}: {e}")
+
+
+def update_snapshot(path: str, steam_id: str, relationship: str, rows: list) -> str:
+    previous = load_snapshot(path, steam_id, relationship)
+    current = prepare_snapshot_rows(rows, previous)
+    changes = None if previous is None else compare_snapshot_rows(
+        previous["friends"], current
+    )
+    save_snapshot(path, steam_id, relationship, current)
+    if previous is None:
+        noun = "friend" if len(current) == 1 else "friends"
+        return f"snapshot baseline saved: {len(current)} {noun}\n  {path}"
+    return render_snapshot_changes(changes, previous["captured_at"])
 
 
 # ── identity resolution ─────────────────────────────────────────────────────
@@ -634,7 +788,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="include status, last logoff, country, game, and profile URL")
     p.add_argument("--no-summary", action="store_true", help="omit the per-year breakdown")
     p.add_argument("--save", action="store_true", help="save key and id to the config file")
-    p.add_argument("--version", action="version", version="steam-friends 1.0")
+    p.add_argument("--track", nargs="?", const="", metavar="FILE",
+                   help="compare with the last run and update its snapshot")
+    p.add_argument("--version", action="version", version=f"steam-friends {VERSION}")
     return p
 
 
@@ -672,6 +828,17 @@ def main() -> int:
 
     fetched_total = len(friends)
     all_rows = build_rows(friends, players, args.utc, args.oldest)
+    if args.track is not None:
+        snapshot_path = args.track or default_snapshot_path(
+            steam_id, args.relationship
+        )
+        try:
+            snapshot_report = update_snapshot(
+                snapshot_path, steam_id, args.relationship, all_rows
+            )
+        except SnapshotError as e:
+            die(str(e))
+        print(snapshot_report, file=sys.stderr)
     all_rows = filter_rows(
         all_rows, args.match or "", args.since or "", args.until or "",
         args.state or "",

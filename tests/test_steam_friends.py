@@ -187,6 +187,77 @@ class PlayerFetchingTests(unittest.TestCase):
         self.assertEqual(players["100"]["personaname"], "Player 100")
 
 
+class SnapshotTests(unittest.TestCase):
+    def test_tracks_added_removed_and_renamed_friends(self):
+        original = [
+            {"steamid": "111", "friend_since": 100, "name": "Alpha",
+             "relationship": "friend"},
+            {"steamid": "222", "friend_since": 200, "name": "Beta",
+             "relationship": "friend"},
+        ]
+        changed = [
+            {"steamid": "111", "friend_since": 100, "name": "Alpha Prime",
+             "relationship": "friend"},
+            {"steamid": "333", "friend_since": 300, "name": "Gamma",
+             "relationship": "friend"},
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "friends.json"
+            baseline = steam_friends.update_snapshot(
+                str(path), "76561198000000000", "friend", original
+            )
+            first = steam_friends.load_snapshot(
+                str(path), "76561198000000000", "friend"
+            )
+            report = steam_friends.update_snapshot(
+                str(path), "76561198000000000", "friend", changed
+            )
+
+            self.assertEqual(
+                steam_friends.stat.S_IMODE(path.stat().st_mode), 0o600
+            )
+
+        self.assertIn("snapshot baseline saved: 2 friends", baseline)
+        self.assertEqual(first["friends"][0]["name"], "Alpha")
+        self.assertIn("1 added, 1 removed, 1 renamed", report)
+        self.assertIn("+ Gamma (333)", report)
+        self.assertIn("- Beta (222)", report)
+        self.assertIn("Alpha → Alpha Prime (111)", report)
+
+    def test_preserves_known_names_when_a_profile_lookup_is_missing(self):
+        previous = {
+            "friends": [
+                {"steamid": "111", "friend_since": 100, "name": "Alpha",
+                 "relationship": "friend"}
+            ]
+        }
+        current = [
+            {"steamid": "111", "friend_since": 100, "name": "",
+             "relationship": "friend"}
+        ]
+
+        rows = steam_friends.prepare_snapshot_rows(current, previous)
+
+        self.assertEqual(rows[0]["name"], "Alpha")
+
+    def test_rejects_a_snapshot_for_a_different_account(self):
+        rows = [
+            {"steamid": "111", "friend_since": 100, "name": "Alpha",
+             "relationship": "friend"}
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "friends.json"
+            steam_friends.update_snapshot(
+                str(path), "76561198000000000", "friend", rows
+            )
+
+            with self.assertRaises(steam_friends.SnapshotError):
+                steam_friends.load_snapshot(
+                    str(path), "76561198000000001", "friend"
+                )
+
+
 class MainTests(unittest.TestCase):
     def test_empty_friend_list_still_writes_output_and_saves_when_requested(self):
         stdout = io.StringIO()
@@ -217,6 +288,42 @@ class MainTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(stdout.getvalue()), [])
         save_config.assert_called_once_with("a" * 32, steam_id)
+
+    def test_tracking_snapshots_the_full_list_before_output_filters(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        steam_id = "76561198000000000"
+        friend = {"steamid": "76561198000000001", "friend_since": 100,
+                  "relationship": "friend"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = pathlib.Path(directory) / "friends.json"
+            argv = [
+                "steam-friends", "--no-names", "--no-summary", "--match",
+                "not-present", "--track", str(snapshot),
+            ]
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(steam_friends.sys, "argv", argv))
+                stack.enter_context(mock.patch.object(steam_friends.sys, "stdout", stdout))
+                stack.enter_context(mock.patch.object(steam_friends.sys, "stderr", stderr))
+                stack.enter_context(mock.patch.object(
+                    steam_friends, "gather_credentials",
+                    return_value=("a" * 32, steam_id, False),
+                ))
+                stack.enter_context(mock.patch.object(
+                    steam_friends, "resolve", return_value=steam_id
+                ))
+                stack.enter_context(mock.patch.object(
+                    steam_friends, "fetch_friends", return_value=[friend]
+                ))
+                result = steam_friends.main()
+
+            saved = steam_friends.load_snapshot(str(snapshot), steam_id, "friend")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(len(saved["friends"]), 1)
+        self.assertIn("snapshot baseline saved: 1 friend", stderr.getvalue())
 
 
 class ConfigTests(unittest.TestCase):

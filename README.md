@@ -40,6 +40,7 @@ after exporting the data.
 --no-names                skip the persona-name lookup
 --no-summary              omit the per-year summary
 --save                    write the key and id to the config file
+--track [FILE]            report changes since the last tracked run
 ```
 
 Credentials come from `--key`/`--id`, then `STEAM_API_KEY`/`STEAM_ID`, then
@@ -66,6 +67,24 @@ standard error, so redirecting or piping the data remains safe.
 `--since` and `--until` are inclusive and use the selected output timezone
 (local by default, UTC with `--utc`). Friendships without a recorded date are
 left out when either date filter is active.
+
+## Tracking changes
+
+Use `--track` to save a baseline, then repeat the same command later to see
+added, removed, and renamed friends. Change reports go to standard error, so
+the selected table, CSV, TSV, or JSON output remains clean.
+
+```sh
+./steam-friends --id yourvanityname --track
+./steam-friends --id yourvanityname --track
+./steam-friends --id yourvanityname --track ./friends-snapshot.json
+```
+
+The default snapshots live under
+`~/.local/state/steam-friends/snapshots/` (or `$XDG_STATE_HOME`) and are kept
+separately for `friend` and `all` relationship modes. Snapshot updates are
+atomic, use mode `0600`, and never contain the API key. A custom snapshot path
+is useful for backups or comparing on another machine.
 
 ## Exit codes
 
