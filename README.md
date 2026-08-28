@@ -31,11 +31,16 @@ after exporting the data.
 --oldest                  oldest friendships first
 --format csv -o out.csv   also tsv, json, table (default)
 --relationship all        include pending invites
+--match alice             match names or SteamIDs (case-insensitive)
+--since 2024-01-01        added on/after a date; pair with --until
+--state online            filter by Steam presence state
+--details                 include status, last logoff, country, game, profile URL
 --limit 20                first 20 rows
 --utc                     UTC instead of local time
 --no-names                skip the persona-name lookup
 --no-summary              omit the per-year summary
 --save                    write the key and id to the config file
+--track [FILE]            report changes since the last tracked run
 ```
 
 Credentials come from `--key`/`--id`, then `STEAM_API_KEY`/`STEAM_ID`, then
@@ -49,6 +54,8 @@ end in either direction instead of appearing as dates in 1970.
 
 Names come from `GetPlayerSummaries`, with up to 100 IDs per call. If a batch
 fails, the command finishes and displays the affected Steam IDs without names.
+The same response powers `--details` and `--state`; both are incompatible with
+`--no-names`, which deliberately skips those requests.
 
 The tool retries on rate limits, 5xx, and network errors, waiting longer each
 time. Bad keys and privacy refusals fail on the first try, because retrying
@@ -56,6 +63,28 @@ won't fix either one.
 
 Data is written to standard output. Progress and warnings are written to
 standard error, so redirecting or piping the data remains safe.
+
+`--since` and `--until` are inclusive and use the selected output timezone
+(local by default, UTC with `--utc`). Friendships without a recorded date are
+left out when either date filter is active.
+
+## Tracking changes
+
+Use `--track` to save a baseline, then repeat the same command later to see
+added, removed, and renamed friends. Change reports go to standard error, so
+the selected table, CSV, TSV, or JSON output remains clean.
+
+```sh
+./steam-friends --id yourvanityname --track
+./steam-friends --id yourvanityname --track
+./steam-friends --id yourvanityname --track ./friends-snapshot.json
+```
+
+The default snapshots live under
+`~/.local/state/steam-friends/snapshots/` (or `$XDG_STATE_HOME`) and are kept
+separately for `friend` and `all` relationship modes. Snapshot updates are
+atomic, use mode `0600`, and never contain the API key. A custom snapshot path
+is useful for backups or comparing on another machine.
 
 ## Exit codes
 
