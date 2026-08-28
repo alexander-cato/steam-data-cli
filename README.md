@@ -30,6 +30,7 @@ after exporting the data.
 ```text
 --oldest                  oldest friendships first
 --format csv -o out.csv   also tsv, json, table (default)
+--columns name,game       select and order exported fields
 --relationship all        include pending invites
 --match alice             match names or SteamIDs (case-insensitive)
 --since 2024-01-01        added on/after a date; pair with --until
@@ -66,6 +67,12 @@ are ascending, while last-logoff and account-creation sorts show the newest
 dates first. `--reverse` flips the selected order. Missing dates and names stay
 at the end in either direction; `--oldest` remains a shorthand for reversing
 the default added-date sort.
+
+Use `--columns` to choose fields and their order in any output format. It
+accepts `added`, `friend_since`, `steamid`, `name`, `relationship`, `status`,
+`last_logoff`, `country`, `game`, `real_name`, `account_created`, `visibility`,
+and `profile_url`. Hyphens can be used in place of underscores. The option
+overrides the usual compact or `--details` column preset.
 
 The tool retries on rate limits, 5xx, and network errors, waiting longer each
 time. Bad keys and privacy refusals fail on the first try, because retrying

@@ -79,6 +79,46 @@ class RowBuildingTests(unittest.TestCase):
         steam_friends.write_output([], "csv", csv_output, show_rel=False)
         self.assertEqual(csv_output.getvalue(), "added,friend_since,steamid,name\n")
 
+    def test_selects_and_orders_output_columns(self):
+        row = {
+            "added": "2024-01-02 12:00", "friend_since": 100,
+            "steamid": "111", "name": "Alpha", "relationship": "friend",
+            "status": "online", "last_logoff": "", "country": "US",
+            "game": "Portal 2", "real_name": "Alice",
+            "account_created": "2012-03-04 05:06", "visibility": "public",
+            "profile_url": "https://example.test/alpha",
+        }
+        json_output = io.StringIO()
+        table_output = io.StringIO()
+
+        steam_friends.write_output(
+            [row], "json", json_output, show_rel=False,
+            columns=["name", "game", "steamid"],
+        )
+        steam_friends.write_output(
+            [row], "table", table_output, show_rel=False,
+            columns=["name", "last_logoff"],
+        )
+
+        self.assertEqual(
+            json.loads(json_output.getvalue()),
+            [{"name": "Alpha", "game": "Portal 2", "steamid": "111"}],
+        )
+        self.assertIn("#  NAME   LAST LOGOFF", table_output.getvalue())
+        self.assertIn("1  Alpha  unknown", table_output.getvalue())
+        self.assertNotIn("STEAMID64", table_output.getvalue())
+
+    def test_validates_custom_output_columns(self):
+        self.assertEqual(
+            steam_friends.parse_columns("name,last-logoff,steamid"),
+            ["name", "last_logoff", "steamid"],
+        )
+        for value in ("", "name,,game", "name,missing", "name,name"):
+            with self.subTest(value=value), self.assertRaises(
+                steam_friends.argparse.ArgumentTypeError
+            ):
+                steam_friends.parse_columns(value)
+
     def test_filters_by_name_or_id_case_insensitively(self):
         rows = [
             {"added": "2024-01-02 12:00", "steamid": "111", "name": "Alpha Fox"},

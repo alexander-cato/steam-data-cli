@@ -79,6 +79,21 @@ STATUS_ORDER = {
     "offline": 6,
     "unknown": 7,
 }
+COLUMN_LABELS = {
+    "added": "ADDED",
+    "friend_since": "FRIEND SINCE",
+    "steamid": "STEAMID64",
+    "name": "NAME",
+    "relationship": "REL",
+    "status": "STATUS",
+    "last_logoff": "LAST LOGOFF",
+    "country": "CC",
+    "game": "GAME",
+    "real_name": "REAL NAME",
+    "account_created": "ACCOUNT CREATED",
+    "visibility": "VISIBILITY",
+    "profile_url": "PROFILE",
+}
 
 
 # ── terminal helpers ────────────────────────────────────────────────────────
@@ -633,6 +648,30 @@ def parse_date(value: str) -> str:
     return normalized
 
 
+def parse_columns(value: str) -> list:
+    """Parse a comma-separated output column list for argparse."""
+    columns = [column.strip().lower().replace("-", "_") for column in value.split(",")]
+    if not columns or any(not column for column in columns):
+        raise argparse.ArgumentTypeError("columns must be a comma-separated list")
+    unknown = [column for column in columns if column not in COLUMN_LABELS]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            "unknown column{} {}; choose from {}".format(
+                "s" if len(unknown) != 1 else "",
+                ", ".join(unknown),
+                ", ".join(COLUMN_LABELS),
+            )
+        )
+    duplicates = sorted({column for column in columns if columns.count(column) > 1})
+    if duplicates:
+        raise argparse.ArgumentTypeError(
+            "duplicate column{} {}".format(
+                "s" if len(duplicates) != 1 else "", ", ".join(duplicates)
+            )
+        )
+    return columns
+
+
 def filter_rows(
     rows: list, query: str = "", since: str = "", until: str = "",
     state: str = "", country: str = "", playing=None,
@@ -662,27 +701,35 @@ def filter_rows(
     return filtered
 
 
-def render_table(rows: list, show_rel: bool, show_details: bool = False) -> str:
+def _table_cell(row: dict, column: str) -> str:
+    value = row[column]
+    if value not in (None, ""):
+        return str(value)
+    if column in ("added", "friend_since", "last_logoff", "account_created"):
+        return "unknown"
+    if column in ("game", "real_name"):
+        return "—"
+    return "?"
+
+
+def render_table(
+    rows: list, show_rel: bool, show_details: bool = False, columns=None
+) -> str:
     if not rows:
         return ""
-    headers = ["#", "ADDED", "STEAMID64", "NAME"] + (["REL"] if show_rel else [])
-    if show_details:
-        headers += [
-            "STATUS", "LAST LOGOFF", "CC", "GAME", "REAL NAME",
-            "ACCOUNT CREATED", "VISIBILITY", "PROFILE",
-        ]
+    if columns is None:
+        columns = ["added", "steamid", "name"]
+        if show_rel:
+            columns.append("relationship")
+        if show_details:
+            columns += [
+                "status", "last_logoff", "country", "game", "real_name",
+                "account_created", "visibility", "profile_url",
+            ]
+    headers = ["#"] + [COLUMN_LABELS[column] for column in columns]
     body = []
     for i, r in enumerate(rows, 1):
-        cells = [str(i), r["added"] or "unknown", r["steamid"], r["name"] or "?"]
-        if show_rel:
-            cells.append(r["relationship"])
-        if show_details:
-            cells += [
-                r["status"], r["last_logoff"] or "unknown", r["country"] or "?",
-                r["game"] or "—", r["real_name"] or "—",
-                r["account_created"] or "unknown", r["visibility"],
-                r["profile_url"] or "?",
-            ]
+        cells = [str(i)] + [_table_cell(r, column) for column in columns]
         body.append(cells)
     widths = [
         max(display_width(h), max(display_width(c[i]) for c in body))
@@ -729,19 +776,20 @@ def output_columns(show_rel: bool, show_details: bool) -> list:
 
 
 def write_output(
-    rows: list, fmt: str, dest, show_rel: bool, show_details: bool = False
+    rows: list, fmt: str, dest, show_rel: bool, show_details: bool = False,
+    columns=None,
 ) -> None:
-    columns = output_columns(show_rel, show_details)
+    selected_columns = columns or output_columns(show_rel, show_details)
     if fmt == "table":
-        table = render_table(rows, show_rel, show_details)
+        table = render_table(rows, show_rel, show_details, columns)
         if table:
             dest.write(table + "\n")
     elif fmt == "json":
-        json.dump([{key: row[key] for key in columns} for row in rows], dest,
+        json.dump([{key: row[key] for key in selected_columns} for row in rows], dest,
                   indent=2, ensure_ascii=False)
         dest.write("\n")
     elif fmt in ("csv", "tsv"):
-        w = csv.DictWriter(dest, fieldnames=columns,
+        w = csv.DictWriter(dest, fieldnames=selected_columns,
                            delimiter="\t" if fmt == "tsv" else ",",
                            extrasaction="ignore", lineterminator="\n")
         w.writeheader()
@@ -864,6 +912,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="only friends in a game, optionally matching GAME")
     p.add_argument("--format", choices=["table", "csv", "tsv", "json"], default="table",
                    help="output format (default: table)")
+    p.add_argument("--columns", type=parse_columns, metavar="LIST",
+                   help="comma-separated output columns in the requested order")
     p.add_argument("-o", "--output", metavar="FILE", help="write to FILE instead of stdout")
     p.add_argument("--limit", type=int, metavar="N", help="show only the first N rows")
     p.add_argument("--utc", action="store_true", help="timestamps in UTC (default: local)")
@@ -944,12 +994,16 @@ def main() -> int:
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8", newline="") as f:
-                write_output(rows, args.format, f, show_rel, args.details)
+                write_output(
+                    rows, args.format, f, show_rel, args.details, args.columns
+                )
         except OSError as e:
             die(f"could not write {args.output}: {e}")
         info(f"wrote {len(rows)} of {total} rows to {args.output}")
     else:
-        write_output(rows, args.format, sys.stdout, show_rel, args.details)
+        write_output(
+            rows, args.format, sys.stdout, show_rel, args.details, args.columns
+        )
         # Flush before touching stderr, or the trailer overtakes a
         # block-buffered stdout and prints above the table.
         sys.stdout.flush()
