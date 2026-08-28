@@ -423,7 +423,9 @@ def render_summary(rows: list, shown: int = 0) -> str:
 
 def write_output(rows: list, fmt: str, dest, show_rel: bool) -> None:
     if fmt == "table":
-        dest.write(render_table(rows, show_rel) + "\n")
+        table = render_table(rows, show_rel)
+        if table:
+            dest.write(table + "\n")
     elif fmt == "json":
         json.dump([{k: v for k, v in r.items() if k != "relationship" or show_rel}
                    for r in rows], dest, indent=2, ensure_ascii=False)
@@ -562,7 +564,7 @@ def main() -> int:
             info(f"no friends returned for {steam_id} "
                  f"(relationship={args.relationship})")
 
-        names = {} if args.no_names or not friends else fetch_names(
+        names = {} if args.no_names else fetch_names(
             [str(f.get("steamid", "")) for f in friends if f.get("steamid")], key)
 
     except SteamError as e:

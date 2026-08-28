@@ -66,7 +66,11 @@ class RowBuildingTests(unittest.TestCase):
         self.assertEqual([row["steamid"] for row in oldest], ["1", "2", "3", "4"])
         self.assertEqual(newest[2]["added"], "")
 
-    def test_empty_json_and_csv_are_valid_outputs(self):
+    def test_empty_output_is_valid_in_every_format(self):
+        table_output = io.StringIO()
+        steam_friends.write_output([], "table", table_output, show_rel=False)
+        self.assertEqual(table_output.getvalue(), "")
+
         json_output = io.StringIO()
         steam_friends.write_output([], "json", json_output, show_rel=False)
         self.assertEqual(json.loads(json_output.getvalue()), [])
