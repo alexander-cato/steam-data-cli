@@ -569,11 +569,68 @@ class MainTests(unittest.TestCase):
             result = steam_friends.main()
 
         self.assertEqual(result, 0)
-        self.assertEqual(
-            [row["steamid"] for row in json.loads(stdout.getvalue())], ["111"]
-        )
+        rows = json.loads(stdout.getvalue())
+        self.assertEqual([row["steamid"] for row in rows], ["111"])
+        self.assertEqual(rows[0]["ban_status"], "vac")
+        self.assertEqual(rows[0]["vac_bans"], 1)
         fetch_bans.assert_called_once_with(["111", "222"], "a" * 32)
         self.assertIn("filters matched 1 of 2 friends", stderr.getvalue())
+
+    def test_rejects_profile_columns_without_the_name_lookup(self):
+        stderr = io.StringIO()
+        argv = ["steam-friends", "--no-names", "--columns", "name,status"]
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(steam_friends.sys, "argv", argv))
+            stack.enter_context(mock.patch.object(steam_friends.sys, "stderr", stderr))
+            with self.assertRaises(SystemExit) as caught:
+                steam_friends.main()
+
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("profile columns", stderr.getvalue())
+
+    def test_allows_id_and_ban_columns_without_the_name_lookup(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        steam_id = "76561198000000000"
+        friends = [{"steamid": "111", "friend_since": 100, "relationship": "friend"}]
+        bans = {
+            "111": {
+                "SteamId": "111", "CommunityBanned": False,
+                "VACBanned": False, "NumberOfVACBans": 0,
+                "DaysSinceLastBan": 0, "NumberOfGameBans": 0,
+                "EconomyBan": "none",
+            }
+        }
+        argv = [
+            "steam-friends", "--no-names", "--no-summary", "--format", "json",
+            "--columns", "steamid,ban_status",
+        ]
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(steam_friends.sys, "argv", argv))
+            stack.enter_context(mock.patch.object(steam_friends.sys, "stdout", stdout))
+            stack.enter_context(mock.patch.object(steam_friends.sys, "stderr", stderr))
+            stack.enter_context(mock.patch.object(
+                steam_friends, "gather_credentials",
+                return_value=("a" * 32, steam_id, False),
+            ))
+            stack.enter_context(
+                mock.patch.object(steam_friends, "resolve", return_value=steam_id)
+            )
+            stack.enter_context(
+                mock.patch.object(steam_friends, "fetch_friends", return_value=friends)
+            )
+            stack.enter_context(
+                mock.patch.object(steam_friends, "fetch_bans", return_value=bans)
+            )
+            result = steam_friends.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            [{"steamid": "111", "ban_status": "clean"}],
+        )
 
 
 class ConfigTests(unittest.TestCase):

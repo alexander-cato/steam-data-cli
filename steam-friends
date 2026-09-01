@@ -106,6 +106,12 @@ BAN_COLUMNS = [
     "game_bans", "days_since_last_ban", "economy_ban",
 ]
 PROFILE_SORTS = {"name", "status", "last-logoff", "account-created"}
+# Columns that come from GetPlayerSummaries, so unavailable under --no-names.
+PROFILE_COLUMNS = {
+    column for column in COLUMN_LABELS
+    if column not in ("added", "friend_since", "steamid", "relationship")
+    and column not in BAN_COLUMNS
+}
 
 
 # ── terminal helpers ────────────────────────────────────────────────────────
@@ -1041,8 +1047,10 @@ def main() -> int:
         die("--country must be a two-letter country code")
     if args.no_names and (
             args.details or args.state or args.country or args.playing is not None
-            or args.sort in PROFILE_SORTS):
-        die("--no-names cannot be combined with profile filters, details, or profile sorting")
+            or args.sort in PROFILE_SORTS
+            or any(column in PROFILE_COLUMNS for column in args.columns or [])):
+        die("--no-names cannot be combined with profile filters, details, "
+            "profile sorting, or profile columns")
 
     needs_bans = (
         args.bans or args.banned_only or args.sort == "ban-status"
@@ -1097,12 +1105,14 @@ def main() -> int:
     rows = all_rows[:args.limit] if args.limit else all_rows
 
     show_rel = args.relationship == "all"
+    # --banned-only implies the lookup, so show what it filtered on.
+    show_bans = args.bans or args.banned_only
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8", newline="") as f:
                 write_output(
                     rows, args.format, f, show_rel, args.details, args.columns,
-                    args.bans,
+                    show_bans,
                 )
         except OSError as e:
             die(f"could not write {args.output}: {e}")
@@ -1110,7 +1120,7 @@ def main() -> int:
     else:
         write_output(
             rows, args.format, sys.stdout, show_rel, args.details, args.columns,
-            args.bans,
+            show_bans,
         )
         # Flush before touching stderr, or the trailer overtakes a
         # block-buffered stdout and prints above the table.

@@ -61,8 +61,9 @@ end in either direction instead of appearing as dates in 1970.
 Names come from `GetPlayerSummaries`, with up to 100 IDs per call. If a batch
 fails, the command finishes and displays the affected Steam IDs without names.
 The same response powers `--details` and `--state`; both are incompatible with
-`--no-names`, which deliberately skips those requests. Profile-backed filters
-and sorting are incompatible with `--no-names` for the same reason.
+`--no-names`, which deliberately skips those requests. Profile-backed filters,
+sorting, and `--columns` selections are incompatible with `--no-names` for the
+same reason.
 
 `--sort added` shows newest friendships first by default. Name and status sorts
 are ascending, while last-logoff and account-creation sorts show the newest
@@ -80,10 +81,10 @@ place of underscores. The option overrides the usual compact, `--details`, or
 
 `--bans` adds one batched `GetPlayerBans` lookup per 100 friends and exports a
 readable ban status plus the individual community, VAC, game, recency, and
-economy fields. `--banned-only` implies the lookup and excludes both clean and
-unknown records. Selecting a ban column with `--columns`, or sorting by
-`--sort ban-status`, also performs the lookup without adding the full ban
-column preset.
+economy fields. `--banned-only` implies the lookup, excludes both clean and
+unknown records, and adds the same ban columns. Selecting a ban column with
+`--columns`, or sorting by `--sort ban-status`, also performs the lookup
+without adding the full ban column preset.
 
 The tool retries on rate limits, 5xx, and network errors, waiting longer each
 time. Bad keys and privacy refusals fail on the first try, because retrying
