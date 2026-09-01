@@ -30,11 +30,17 @@ after exporting the data.
 ```text
 --oldest                  oldest friendships first
 --format csv -o out.csv   also tsv, json, table (default)
+--columns name,game       select and order exported fields
 --relationship all        include pending invites
 --match alice             match names or SteamIDs (case-insensitive)
 --since 2024-01-01        added on/after a date; pair with --until
 --state online            filter by Steam presence state
---details                 include status, last logoff, country, game, profile URL
+--country US              filter by two-letter profile country code
+--playing [portal]        friends in a game, optionally matching its name
+--sort name --reverse     sort by name, status, last logoff, or account creation
+--details                 include status, profile, game, identity, and account details
+--bans                    include public VAC, game, community, and economy bans
+--banned-only             show only friends with a reported ban
 --limit 20                first 20 rows
 --utc                     UTC instead of local time
 --no-names                skip the persona-name lookup
@@ -55,7 +61,30 @@ end in either direction instead of appearing as dates in 1970.
 Names come from `GetPlayerSummaries`, with up to 100 IDs per call. If a batch
 fails, the command finishes and displays the affected Steam IDs without names.
 The same response powers `--details` and `--state`; both are incompatible with
-`--no-names`, which deliberately skips those requests.
+`--no-names`, which deliberately skips those requests. Profile-backed filters,
+sorting, and `--columns` selections are incompatible with `--no-names` for the
+same reason.
+
+`--sort added` shows newest friendships first by default. Name and status sorts
+are ascending, while last-logoff and account-creation sorts show the newest
+dates first. `--reverse` flips the selected order. Missing dates and names stay
+at the end in either direction; `--oldest` remains a shorthand for reversing
+the default added-date sort.
+
+Use `--columns` to choose fields and their order in any output format. It
+accepts `added`, `friend_since`, `steamid`, `name`, `relationship`, `status`,
+`last_logoff`, `country`, `game`, `real_name`, `account_created`, `visibility`,
+`profile_url`, `ban_status`, `community_banned`, `vac_banned`, `vac_bans`,
+`game_bans`, `days_since_last_ban`, and `economy_ban`. Hyphens can be used in
+place of underscores. The option overrides the usual compact, `--details`, or
+`--bans` column preset.
+
+`--bans` adds one batched `GetPlayerBans` lookup per 100 friends and exports a
+readable ban status plus the individual community, VAC, game, recency, and
+economy fields. `--banned-only` implies the lookup, excludes both clean and
+unknown records, and adds the same ban columns. Selecting a ban column with
+`--columns`, or sorting by `--sort ban-status`, also performs the lookup
+without adding the full ban column preset.
 
 The tool retries on rate limits, 5xx, and network errors, waiting longer each
 time. Bad keys and privacy refusals fail on the first try, because retrying
